@@ -4,6 +4,18 @@ import json
 import sys
 import re
 
+# Windows has no LANG/LC_ALL. When stdout is a pipe -- which it always is here,
+# because mousiki captures it -- Python picks the process ANSI code page for
+# the pipe encoding, so printing a non-Latin track title raises
+# UnicodeEncodeError and kills the script outright. Forcing UTF-8 on both
+# streams matches what the C++ side already decodes.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 def search(query, limit=5):
     url = "https://www.youtube.com/youtubei/v1/search"
     headers = {
