@@ -1,4 +1,9 @@
 #include "console_log.h"
+#include "path_utf8.h"
+#include <cstdio>
+#ifdef _WIN32
+#include "win_compat.h"
+#endif
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -20,7 +25,13 @@ static std::string now_hms() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tmv{};
+#ifdef _WIN32
+    // MSVC has localtime_s, whose arguments are the reverse of localtime_r's --
+    // an easy silent mistake, so it is wrapped rather than inlined here.
+    tmv = win_localtime(t);
+#else
     localtime_r(&t, &tmv);
+#endif
     char buf[16];
     std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     return buf;
@@ -39,7 +50,7 @@ void ConsoleLog::init(LogVerbosity level) {
     std::error_code ec;
     fs::path dir = log_dir();
     fs::create_directories(dir, ec);
-    log_path_ = (dir / "console.log").string();
+    log_path_ = path_utf8(dir / "console.log");
 
     // Truncate (std::ios::trunc, not append) -- this is exactly the
     // "previous session's log gets cleaned, a new one starts" behavior:
