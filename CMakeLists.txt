@@ -95,6 +95,11 @@ if(ANDROID)
 elseif(WIN32)
   target_compile_definitions(mousiki PRIVATE
     MUISC_PLATFORM_WINDOWS=1 MA_ENABLE_ONLY_SPECIFIC_BACKENDS=1 MA_ENABLE_WASAPI=1
+    # Target Windows 10. MinGW-w64 in particular defaults to an older API
+    # level, which hides SHGetKnownFolderPath and the
+    # PROC_THREAD_ATTRIBUTE_HANDLE_LIST machinery process_util.cpp needs.
+    _WIN32_WINNT=0x0A00
+    NTDDI_VERSION=0x0A000000
     # miniaudio drags in windows.h, whose min/max macros collide with the
     # std::min / std::max / std::clamp used throughout the renderer.
     NOMINMAX
@@ -107,7 +112,8 @@ elseif(WIN32)
   # ole32    -> CoTaskMemFree, and miniaudio's WASAPI/COM usage
   # winmm    -> miniaudio
   # shell32  -> SHGetKnownFolderPath (the profile and Music known folders)
-  target_link_libraries(mousiki PRIVATE ole32 winmm shell32)
+  # uuid     -> the FOLDERID_* GUID symbols those known folders are named by
+  target_link_libraries(mousiki PRIVATE ole32 winmm shell32 uuid)
 elseif(APPLE)
   target_compile_definitions(mousiki PRIVATE MUISC_PLATFORM_MACOS=1 MA_ENABLE_ONLY_SPECIFIC_BACKENDS=1 MA_ENABLE_COREAUDIO=1)
   target_link_libraries(mousiki PRIVATE "-framework CoreAudio" "-framework AudioToolbox" "-framework CoreFoundation" "-framework AudioUnit")

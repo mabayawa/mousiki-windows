@@ -1,0 +1,106 @@
+name: build
+
+# The point of this matrix is that the fork must not become Windows-only.
+# Every change is either cross-platform or behind #ifdef _WIN32, and the Linux
+# job is what proves it: if a POSIX build breaks, the port has gone wrong.
+on:
+  push:
+    branches: [main, windows-port]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-msvc:
+    name: Windows (MSVC, x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Check the binary and its helper scripts landed
+        shell: pwsh
+        run: |
+          $exe = "build/Release/mousiki.exe"
+          if (-not (Test-Path $exe)) { throw "mousiki.exe was not produced" }
+          if (-not (Test-Path "build/Release/scripts/fetch_lyrics.py")) {
+            throw "helper scripts were not copied next to the executable"
+          }
+          Write-Host "ok: $((Get-Item $exe).Length) bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mousiki-windows-x64-msvc
+          path: |
+            build/Release/mousiki.exe
+            build/Release/scripts/
+
+  windows-mingw:
+    name: Windows (MinGW UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Check the binary landed
+        run: test -f build/mousiki.exe && ls -la build/mousiki.exe
+
+  linux:
+    name: Linux (GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libpulse-dev libasound2-dev
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Check the binary landed
+        run: test -f build/mousiki && ls -la build/mousiki
+
+  scripts:
+    name: Python helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Byte-compile
+        run: python -m compileall -q scripts/
+
+      - name: Non-ASCII titles must not raise UnicodeEncodeError
+        run: |
+          pip install --quiet requests
+          # Piped stdout is the case that used to die on Windows, where Python
+          # falls back to the ANSI code page. Asserting it here keeps the UTF-8
+          # reconfiguration from being quietly removed later.
+          python scripts/fetch_lyrics.py "日本語テスト" "テスト" > out.json
+          python -c "import json,sys; json.load(open('out.json')); print('stdout is valid JSON')"

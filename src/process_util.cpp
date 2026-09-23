@@ -2,6 +2,7 @@
 #include "console_log.h"
 
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <sstream>
 

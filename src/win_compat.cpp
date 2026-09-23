@@ -6,6 +6,14 @@
 #include <shlobj.h>
 #include <knownfolders.h>
 
+// Older MinGW-w64 headers predate this flag even at a modern API level.
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+#endif
+
 #include <algorithm>
 #include <cstdlib>
 #include <cwchar>
@@ -603,7 +611,12 @@ std::string win_os_version() {
 
 std::tm win_localtime(std::time_t t) {
     std::tm out{};
+#if defined(_MSC_VER)
     localtime_s(&out, &t);   // note: arguments are the reverse of localtime_r
+#else
+    // MinGW-w64 exposes the POSIX spelling rather than the MSVC one.
+    localtime_r(&t, &out);
+#endif
     return out;
 }
 
