@@ -1,2 +1,21 @@
 build/
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Visual Studio / MSVC
+.vs/
+out/
+*.user
+CMakeUserPresets.json
+CMakeSettings.json
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Local agent/tooling state
+.claude/

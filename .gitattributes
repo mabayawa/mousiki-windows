@@ -1,0 +1,22 @@
+# LF in the repository AND in the working tree, on every platform. Upstream is
+# LF; without eol=lf a Windows checkout rewrites all 60 files to CRLF, which
+# turns every diff against upstream into whole-file noise. MSVC, GCC and Clang
+# all compile LF sources without complaint.
+* text=auto eol=lf
+
+# Must stay LF or they break on the platforms that run them.
+*.sh   text eol=lf
+*.py   text eol=lf
+CMakeLists.txt text eol=lf
+
+# Windows-native scripts.
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Never touch these.
+*.gif  binary
+*.png  binary
+*.jpg  binary
+*.opus binary
+*.mp3  binary
