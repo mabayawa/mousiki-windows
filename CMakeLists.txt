@@ -142,8 +142,14 @@ if(MSVC)
 endif()
 
 if(MINGW)
-  # Produce an executable that does not need the GCC runtime DLLs alongside it.
-  target_link_options(mousiki PRIVATE -static-libgcc -static-libstdc++)
+  # Produce an executable that runs outside an MSYS2 shell.
+  #
+  # -static-libgcc -static-libstdc++ alone is not enough: find_package(Threads)
+  # pulls in -lpthread, which on MinGW is libwinpthread-1.dll, so the binary
+  # still fails to start anywhere that DLL is not on PATH. Full -static covers
+  # it; everything else the link needs (kernel32, ole32, shell32, winmm, uuid)
+  # is a system import library and is unaffected.
+  target_link_options(mousiki PRIVATE -static)
 endif()
 
 # ---------------------------------------------------------------------------

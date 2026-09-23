@@ -390,7 +390,13 @@ int win_poll_key() {
             case VK_RIGHT:  return 'C';
             case VK_LEFT:   return 'D';
             case VK_ESCAPE: return 27;
-            case VK_RETURN: return '\r';
+            // '\n', not '\r'. The console reports Enter as CR, but the POSIX
+            // side never sees one: upstream clears only ECHO and ICANON, so
+            // ICRNL is still set and the line discipline translates CR to NL
+            // before read() ever returns. app.cpp's hotkey_string_to_key()
+            // consequently maps "ENTER" to '\n', and returning CR here would
+            // leave the Enter key doing nothing at all.
+            case VK_RETURN: return '\n';
             case VK_TAB:    return '\t';
             case VK_BACK:   return 127;   // POSIX sends DEL for backspace
             default: break;
@@ -611,12 +617,11 @@ std::string win_os_version() {
 
 std::tm win_localtime(std::time_t t) {
     std::tm out{};
-#if defined(_MSC_VER)
-    localtime_s(&out, &t);   // note: arguments are the reverse of localtime_r
-#else
-    // MinGW-w64 exposes the POSIX spelling rather than the MSVC one.
-    localtime_r(&t, &out);
-#endif
+    // Both MSVC and MinGW-w64's UCRT provide the Microsoft spelling, whose
+    // arguments are the reverse of POSIX localtime_r's -- destination first.
+    // MinGW does not provide localtime_r at all against the UCRT, so there is
+    // no POSIX fallback to prefer here.
+    localtime_s(&out, &t);
     return out;
 }
 

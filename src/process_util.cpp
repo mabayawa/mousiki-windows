@@ -96,12 +96,17 @@ HANDLE job_handle() {
     return job;
 }
 
+// Returns nullptr rather than INVALID_HANDLE_VALUE on failure, so callers can
+// test it the same way they test every other handle here. INVALID_HANDLE_VALUE
+// is (HANDLE)-1, which is truthy -- passing it on to an inherit list or a
+// std handle is exactly the kind of mistake this avoids.
 HANDLE open_nul(DWORD access) {
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
-    return CreateFileW(L"NUL", access, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                       OPEN_EXISTING, 0, nullptr);
+    HANDLE h = CreateFileW(L"NUL", access, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                           OPEN_EXISTING, 0, nullptr);
+    return (h == INVALID_HANDLE_VALUE) ? nullptr : h;
 }
 
 } // namespace
@@ -169,15 +174,20 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
     if (nul_in)  inherit.push_back(nul_in);
     if (nul_err) inherit.push_back(nul_err);
 
+    // The sizing call is expected to fail with ERROR_INSUFFICIENT_BUFFER; its
+    // job is only to fill in attr_size.
     SIZE_T attr_size = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
     std::vector<char> attr_buf(attr_size);
     auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
-    bool have_attrs = InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+    // Tracked separately from have_attrs: if the list initialises but the
+    // update fails, it still has to be deleted.
+    bool attrs_inited = InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) != FALSE;
+    bool have_attrs = attrs_inited &&
                       UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                                 inherit.data(),
                                                 inherit.size() * sizeof(HANDLE),
-                                                nullptr, nullptr);
+                                                nullptr, nullptr) != FALSE;
 
     STARTUPINFOEXW si{};
     si.StartupInfo.cb = have_attrs ? sizeof(STARTUPINFOEXW) : sizeof(STARTUPINFOW);
@@ -204,7 +214,7 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
                              TRUE, flags, nullptr, nullptr,
                              &si.StartupInfo, &pi);
 
-    if (have_attrs) DeleteProcThreadAttributeList(attrs);
+    if (attrs_inited) DeleteProcThreadAttributeList(attrs);
     CloseHandle(write_end);
     if (nul_in)  CloseHandle(nul_in);
     if (nul_err) CloseHandle(nul_err);
