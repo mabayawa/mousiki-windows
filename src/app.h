@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -315,10 +316,38 @@ private:
     std::atomic<bool> load_in_progress_{false};
     std::atomic<int> load_stage_{0};
     std::chrono::steady_clock::time_point load_started_at_;
+    // --- audio device worker ---
+    //
+    // One persistent thread owns the whole device lifecycle for the session.
+    // Upstream spawned a fresh std::thread per track, which is fine on
+    // ALSA/PulseAudio/CoreAudio but not on WASAPI: miniaudio initialises COM
+    // on whichever thread creates the device, and COM interfaces are
+    // apartment-affine. When a per-track thread exits, COM is uninitialised
+    // for it and the IAudioClient created there is left owned by a thread that
+    // no longer exists -- so the next track's init, or the eventual uninit,
+    // reaches through a dangling apartment.
+    //
+    // Keeping init/start/stop/uninit on a single thread for the whole session
+    // removes the affinity problem outright, and costs nothing on the other
+    // platforms. The generation counter still supersedes stale requests
+    // exactly as it did before; only the thread's lifetime changed.
+    struct DeviceRequest {
+        std::shared_ptr<StreamingPcm> pcm;
+        double start_sec = 0.0;
+        int volume = 70;
+        int gen = 0;
+        bool valid = false;
+    };
     std::thread device_thread_;
     std::mutex device_mutex_;
-    std::atomic<int> device_gen_{0}; // incremented each launch; stale threads abort when their gen != current
+    std::condition_variable device_cv_;
+    DeviceRequest device_request_;      // latest request wins; guarded by device_mutex_
+    bool device_worker_quit_ = false;   // guarded by device_mutex_
+    std::atomic<int> device_gen_{0};    // incremented each launch; stale requests are dropped
     void launch_device_play_async();
+    void start_device_worker();
+    void stop_device_worker();
+    void device_worker_loop();
 
     PendingLoad pending_load_;
     void launch_load_async(fs::path local_path, std::string title, std::string artist,

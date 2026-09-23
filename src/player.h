@@ -48,7 +48,7 @@ public:
 
     void seek_relative(double delta_sec);
     void set_volume(int volume_pct);
-    int volume() const { return volume_pct_; }
+    int volume() const { return volume_pct_.load(); }
 
     double poll_elapsed() const;
     bool finished() const { return finished_.load(); }
@@ -72,12 +72,21 @@ private:
 
     std::shared_ptr<StreamingPcm> pcm_;
     FftVisualizer* fft_sink_ = nullptr;
-    int sample_rate_ = 44100;
+    // These are read from the main/render thread every frame while the
+    // device worker thread may be inside play(). They are atomics rather than
+    // mutex-protected state on purpose: a mutex held across ma_device_init()
+    // would block the render loop for however long device initialisation
+    // stalls, which is the exact thing running play() off-thread exists to
+    // avoid.
+    std::atomic<int> sample_rate_{44100};
     std::atomic<long long> cursor_frames_{0};
     std::atomic<bool> finished_{false};
     std::atomic<float> gain_{0.7f};
     std::atomic<bool> paused_{false};
-    int volume_pct_ = 70;
+    std::atomic<int> volume_pct_{70};
+    // Reserved capacity of the current buffer, cached so seek_relative() never
+    // has to touch the pcm_ shared_ptr the worker thread may be reassigning.
+    std::atomic<long long> capacity_frames_{0};
 
     static void data_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count);
 };

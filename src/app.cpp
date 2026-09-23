@@ -10,8 +10,13 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#include "path_utf8.h"
+#if defined(_WIN32)
+#include "win_compat.h"
+#else
 #include <unistd.h>
 #include <sys/utsname.h>
+#endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -342,7 +347,21 @@ fs::path find_lyrics_script() {
     fs::path cwd_candidate = fs::path("scripts") / "fetch_lyrics.py";
     if (fs::exists(cwd_candidate)) return cwd_candidate;
 
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    // There is no /proc/self/exe. GetModuleFileNameW is the direct equivalent,
+    // and it is what makes `mousiki.exe` runnable from anywhere rather than
+    // only from the directory that happens to contain scripts/.
+    {
+        std::string exe = win_executable_path();
+        if (!exe.empty()) {
+            fs::path exe_dir = path_from_utf8(exe).parent_path();
+            fs::path p = exe_dir / "scripts" / "fetch_lyrics.py";
+            if (fs::exists(p)) return p;
+            p = exe_dir.parent_path() / "scripts" / "fetch_lyrics.py";
+            if (fs::exists(p)) return p;
+        }
+    }
+#elif defined(__APPLE__)
     char exe_buf[4096];
     uint32_t size = sizeof(exe_buf);
     if (_NSGetExecutablePath(exe_buf, &size) == 0) {
@@ -378,7 +397,7 @@ App::App() {
     
     // Inject the cache directory into local music paths so streamed songs
     // automatically appear in the local view for seamless offline playback
-    settings_.local_music_paths.push_back(cache_.cache_dir().string());
+    settings_.local_music_paths.push_back(path_utf8(cache_.cache_dir()));
     
     all_local_tracks_ = local_source_.scan(settings_.local_music_paths);
     local_view_ = all_local_tracks_;
@@ -461,7 +480,7 @@ std::vector<LocalTrack> App::filter_and_rank_local(const std::string& query) con
         std::string artist = t.folder_artist;
         {
             std::lock_guard<std::mutex> lk(row_meta_mutex_);
-            auto it = row_meta_cache_.find(t.path.string());
+            auto it = row_meta_cache_.find(path_utf8(t.path));
             if (it != row_meta_cache_.end() && !it->second.artist.empty()) artist = it->second.artist;
         }
         double title_score = fuzzy_score(query, t.title);
@@ -501,7 +520,7 @@ void App::apply_local_sort(std::vector<LocalTrack>& tracks) const {
         std::stable_sort(tracks.begin(), tracks.end(), [this](const LocalTrack& a, const LocalTrack& b) {
             auto artist_of = [this](const LocalTrack& t) {
                 std::lock_guard<std::mutex> lk(row_meta_mutex_);
-                auto it = row_meta_cache_.find(t.path.string());
+                auto it = row_meta_cache_.find(path_utf8(t.path));
                 return (it != row_meta_cache_.end() && !it->second.artist.empty()) ? it->second.artist : t.folder_artist;
             };
             return lower(artist_of(a)) < lower(artist_of(b));
@@ -519,7 +538,7 @@ void App::refresh_local_view() {
         std::vector<LocalTrack> filtered;
         filtered.reserve(local_view_.size());
         for (auto& t : local_view_) {
-            if (t.path.parent_path().string() == folder_filter_) filtered.push_back(t);
+            if (path_utf8(t.path.parent_path()) == folder_filter_) filtered.push_back(t);
         }
         local_view_ = std::move(filtered);
     }
@@ -737,7 +756,7 @@ void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path pa
     lyrics_ready_ = false;
     int my_epoch = ++lyrics_epoch_;
     std::thread([this, title, artist, path, force_network, my_epoch]() {
-        LyricsResult r = fetch_synced_lyrics(title, artist, lyrics_script_.string(), path, force_network);
+        LyricsResult r = fetch_synced_lyrics(title, artist, path_utf8(lyrics_script_), path, force_network);
         std::lock_guard<std::mutex> lock(lyrics_mutex_);
         if (my_epoch != lyrics_epoch_.load()) return; // a newer/retried fetch has since started — discard
         lyrics_result_ = std::move(r);
@@ -796,22 +815,56 @@ void App::poll_pending_load() {
     status_line_.clear();
 }
 
+void App::start_device_worker() {
+    if (device_thread_.joinable()) return;
+    device_thread_ = std::thread([this] {
+        // An exception escaping a std::thread calls std::terminate, which on
+        // Windows kills the process with no message whatsoever -- the app
+        // simply vanishes. Log it instead.
+        try {
+            device_worker_loop();
+        } catch (const std::exception& e) {
+            ConsoleLog::instance().log_verbose(
+                std::string("audio: device worker aborted: ") + e.what());
+        } catch (...) {
+            ConsoleLog::instance().log_verbose("audio: device worker aborted: unknown exception");
+        }
+    });
+}
+
+void App::device_worker_loop() {
+    for (;;) {
+        DeviceRequest req;
+        {
+            std::unique_lock<std::mutex> lk(device_mutex_);
+            device_cv_.wait(lk, [this] { return device_worker_quit_ || device_request_.valid; });
+            if (device_worker_quit_) break;
+            req = std::move(device_request_);
+            device_request_ = DeviceRequest{};
+        }
+        // A newer request landed while this one was still queued -- the user
+        // skipped on before the device came up. Dropping it here is what stops
+        // a track the user has already moved past from briefly starting.
+        if (req.gen != device_gen_.load()) continue;
+        player_.play(req.pcm, req.start_sec, req.volume, &fft_);
+    }
+    // Tear the device down on the same thread that created it.
+    player_.stop();
+}
+
+void App::stop_device_worker() {
+    {
+        std::lock_guard<std::mutex> lk(device_mutex_);
+        device_worker_quit_ = true;
+    }
+    device_cv_.notify_all();
+    if (device_thread_.joinable()) device_thread_.join();
+}
+
 void App::launch_device_play_async() {
-    // Never join here — that would risk blocking whichever thread calls
-    // this (poll_pending_load / advance_track, both on the main thread)
-    // on however long the OLD device op takes to finish. Detach it: the
-    // old attempt just finishes on its own (Player::play() stops the
-    // previous device as its first step anyway, so an old in-flight
-    // play() call safely becomes a no-op-ish teardown once it gets to
-    // run, even if a newer one has already taken over by then).
-    //
-    // BUG FIX #2: previously the detached old thread could call
-    // ma_device_start() on a device that the new thread had already torn
-    // down inside play() → stop() — undefined behaviour and the root
-    // cause of audio glitches on fast track-switching. The generation
-    // counter lets the old thread detect that it has been superseded and
-    // bail out before it ever touches the device.
-    if (device_thread_.joinable()) device_thread_.detach();
+    // Device work never runs on the main thread: ma_device_init() can stall
+    // for a noticeable time, and blocking here would freeze the render loop.
+    start_device_worker();
     int my_gen = ++device_gen_;
     auto pcm = current_pcm_;
     int vol = player_.volume() > 0 ? player_.volume() : 70;
@@ -824,11 +877,11 @@ void App::launch_device_play_async() {
     // invariant obvious rather than implicit.
     double start_sec = resume_start_sec_;
     resume_start_sec_ = 0.0;
-    device_thread_ = std::thread([this, pcm, vol, my_gen, start_sec]() {
+    {
         std::lock_guard<std::mutex> lk(device_mutex_);
-        if (my_gen != device_gen_.load()) return; // superseded — a newer play request won
-        player_.play(pcm, start_sec, vol, &fft_);
-    });
+        device_request_ = DeviceRequest{pcm, start_sec, vol, my_gen, true};
+    }
+    device_cv_.notify_one();
 }
 
 void App::poll_pending_waveform() {
@@ -952,7 +1005,7 @@ void App::play_next_from_queue() {
     if (queue_selected_ >= idx && queue_selected_ > 0) --queue_selected_; // index shifted down by the erase
     clamp_queue_selected();
     if (item.is_local) {
-        LocalTrack t{fs::path(item.local_path).stem().string(), item.local_path, item.artist};
+        LocalTrack t{path_utf8(fs::path(item.local_path).stem()), item.local_path, item.artist};
         start_local_track(t);
     } else {
         OnlineResult r{item.video_id, item.title, item.artist};
@@ -1065,7 +1118,7 @@ SnapshotData App::build_snapshot() const {
     if (has_track_) {
         snap.has_now_playing = true;
         snap.now_playing.is_local = current_is_local_;
-        snap.now_playing.path = current_is_local_ ? current_path_.string() : std::string();
+        snap.now_playing.path = current_is_local_ ? path_utf8(current_path_) : std::string();
         snap.now_playing.video_id = current_is_local_ ? std::string() : current_video_id_;
         snap.now_playing.title = metadata_.name;
         snap.now_playing.artist = metadata_.artist;
@@ -1075,7 +1128,7 @@ SnapshotData App::build_snapshot() const {
     for (const auto& item : queue_) {
         SnapshotTrack t;
         t.is_local = item.is_local;
-        t.path = item.is_local ? item.local_path.string() : std::string();
+        t.path = item.is_local ? path_utf8(item.local_path) : std::string();
         t.video_id = item.is_local ? std::string() : item.video_id;
         t.title = item.title;
         t.artist = item.artist;
@@ -1108,7 +1161,7 @@ void App::restore_snapshot(const SnapshotData& snap) {
             fs::path p(snap.now_playing.path);
             std::error_code ec;
             if (fs::exists(p, ec)) {
-                LocalTrack t{p.stem().string(), p, snap.now_playing.artist};
+                LocalTrack t{path_utf8(p.stem()), p, snap.now_playing.artist};
                 start_local_track(t);
                 log_event("resuming: " + t.title);
             } else {
@@ -1501,7 +1554,7 @@ void App::start_local_track(const LocalTrack& track) {
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
     fs::path parent = track.path.parent_path().filename();
     launch_load_async(track.path, track.title, track.folder_artist == "-" ? "" : track.folder_artist,
-                       parent.string() + "/", /*is_local=*/true, /*video_id=*/"");
+                       path_utf8(parent) + "/", /*is_local=*/true, /*video_id=*/"");
 }
 
 void App::start_online_track(const OnlineResult& result) {
@@ -1797,9 +1850,9 @@ void App::handle_key(int key) {
         case 'f': case 'F': // filter local list to the hovering track's folder
             if (list_source_ == ListSource::Local && !local_view_.empty() &&
                 selected_ >= 0 && selected_ < static_cast<int>(local_view_.size())) {
-                folder_filter_ = local_view_[selected_].path.parent_path().string();
+                folder_filter_ = path_utf8(local_view_[selected_].path.parent_path());
                 refresh_local_view();
-                log_event("filtered: " + fs::path(folder_filter_).filename().string());
+                log_event("filtered: " + path_utf8(fs::path(folder_filter_).filename()));
             }
             break;
         case 'c': // clear folder filter
@@ -1822,7 +1875,7 @@ void App::handle_key(int key) {
             break;
         case 'y': case 'Y': // save cached stream to local music path
             if (has_track_) {
-                if (current_path_.string().find(".cache") != std::string::npos || metadata_.location == "youtube") {
+                if (path_utf8(current_path_).find(".cache") != std::string::npos || metadata_.location == "youtube") {
                     std::string dest_dir;
                     if (!settings_.local_music_paths.empty()) {
                         dest_dir = settings_.local_music_paths[0];
@@ -1839,18 +1892,18 @@ void App::handle_key(int key) {
                     for (char& c : safe_artist) if (c == '/' || c == '\\') c = '_';
                     
                     std::string filename = safe_artist.empty() ? safe_name : safe_name + " - " + safe_artist;
-                    filename += current_path_.extension().string();
+                    filename += path_utf8(current_path_.extension());
                     
                     fs::path dest_path = fs::path(dest_dir) / filename;
                     if (fs::exists(dest_path, ec)) {
-                        status_line_ = "already saved: " + dest_path.filename().string();
+                        status_line_ = "already saved: " + path_utf8(dest_path.filename());
                     } else {
                         fs::copy_file(current_path_, dest_path, fs::copy_options::overwrite_existing, ec);
                         if (!ec) {
                             fs::remove(current_path_, ec);
                             current_path_ = dest_path; // update so sidecar lyrics go to the new folder
                             metadata_.location = dest_dir;
-                            status_line_ = "saved to " + dest_path.string();
+                            status_line_ = "saved to " + path_utf8(dest_path);
                             refresh_local_view();
                         } else {
                             status_line_ = "failed to save: " + ec.message();
@@ -1918,7 +1971,7 @@ void App::ensure_visible_row_meta() {
     if (list_source_ != ListSource::Local) return;
     for (int i = scroll_; i < std::min<int>(local_view_.size(), scroll_ + list_visible_rows_); ++i) {
         const auto& t = local_view_[i];
-        std::string key = t.path.string();
+        std::string key = path_utf8(t.path);
         {
             std::lock_guard<std::mutex> lk(row_meta_mutex_);
             if (row_meta_cache_.count(key)) continue; // already resolved (native path or background sweep)
@@ -1979,7 +2032,7 @@ void App::launch_row_meta_resolver() {
     // worst case on quit is one orphaned ffprobe call, not a crash.
     std::thread([this, paths]() {
         for (auto& p : paths) {
-            std::string key = p.string();
+            std::string key = path_utf8(p);
             {
                 std::lock_guard<std::mutex> lk(row_meta_mutex_);
                 if (row_meta_cache_.count(key)) continue; // native parse (or an earlier pass) already got it
@@ -2490,7 +2543,7 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
                 std::string artist = t.folder_artist;
                 {
                     std::lock_guard<std::mutex> lk(row_meta_mutex_);
-                    auto it = row_meta_cache_.find(t.path.string());
+                    auto it = row_meta_cache_.find(path_utf8(t.path));
                     if (it != row_meta_cache_.end()) {
                         dur = it->second.duration_sec;
                         if (!it->second.artist.empty()) artist = it->second.artist;
@@ -3445,10 +3498,14 @@ int App::run() {
     {
         // Verbose-only startup facts -- "what the OS provided" at the
         // very start of the session, before anything else has run.
+#if defined(_WIN32)
+        ConsoleLog::instance().log_verbose("os: " + win_os_version());
+#else
         struct utsname uts{};
         if (uname(&uts) == 0) {
             ConsoleLog::instance().log_verbose(std::string("os: ") + uts.sysname + " " + uts.release + " " + uts.machine);
         }
+#endif
         ConsoleLog::instance().log_verbose("home: " + std::string(std::getenv("HOME") ? std::getenv("HOME") : "(unset)"));
     }
 
@@ -3516,7 +3573,10 @@ int App::run() {
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
     }
 
-    player_.stop();
+    // Signals the worker to finish and joins it; the worker calls
+    // player_.stop() itself, so the device is destroyed on the thread that
+    // created it.
+    stop_device_worker();
     term.restore();
     save_settings(settings_);
     // Final snapshot on a clean quit -- same single-canonical-file
@@ -3528,7 +3588,6 @@ int App::run() {
     }
     if (load_thread_.joinable()) load_thread_.join();
     if (search_thread_.joinable()) search_thread_.join();
-    if (device_thread_.joinable()) device_thread_.join();
     if (bulk_add_thread_.joinable()) bulk_add_thread_.join();
     std::cout << "\nbye.\n";
     return 0;
