@@ -64,9 +64,13 @@ static bool json_get_number(const std::string& json, const std::string& key, dou
 
 std::vector<OnlineResult> OnlineSource::search(const std::string& query, int count) {
     std::vector<OnlineResult> results;
-    std::string cmd = "yt-dlp -4 --no-warnings --match-filters \"categories *= 'Music' & duration >= 90\" --flat-playlist -j "
-                       "\"ytsearch" + std::to_string(count) + ":" + query + "\"";
-    ProcResult r = run_capture(cmd);
+    // `query` travels as its own argv element. Upstream spliced it into an
+    // `sh -c` string unquoted, so a backtick or $( ) in the search box ran as
+    // a command.
+    ProcResult r = run_capture({"yt-dlp", "-4", "--no-warnings",
+                                "--match-filters", "categories *= 'Music' & duration >= 90",
+                                "--flat-playlist", "-j",
+                                "ytsearch" + std::to_string(count) + ":" + query});
     if (r.out.empty()) return results;
 
     std::istringstream stream(r.out);
@@ -107,8 +111,8 @@ std::vector<OnlineResult> OnlineSource::list_playlist(const std::string& url, st
     // approach as search() above. Works for a playlist URL (many
     // entries) and degrades gracefully to a single entry for a plain
     // video URL.
-    std::string cmd = "yt-dlp -4 --no-warnings --flat-playlist -j " + shell_quote(trimmed);
-    ProcResult r = run_capture(cmd);
+    ProcResult r = run_capture({"yt-dlp", "-4", "--no-warnings",
+                                "--flat-playlist", "-j", trimmed});
     if (!r.ok() || r.out.empty()) {
         if (error_out) *error_out = "yt-dlp couldn't list that link (exit " + std::to_string(r.exit_code) + ")";
         return results;

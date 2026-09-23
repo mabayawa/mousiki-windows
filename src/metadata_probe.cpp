@@ -1,4 +1,5 @@
 #include "metadata_probe.h"
+#include "path_utf8.h"
 #include "process_util.h"
 #include <algorithm>
 #include <cctype>
@@ -14,9 +15,10 @@ static std::string to_upper(std::string s) {
 }
 
 double probe_duration_seconds(const fs::path& file) {
-    std::string cmd = "ffprobe -v error -show_entries format=duration -of csv=p=0 "
-                       + shell_quote(file.string());
-    ProcResult r = run_capture(cmd);
+    ProcResult r = run_capture({"ffprobe", "-v", "error",
+                                "-show_entries", "format=duration",
+                                "-of", "csv=p=0",
+                                path_utf8(file)});
     if (r.out.empty()) return -1.0;
     try {
         return std::stod(r.out);
@@ -27,9 +29,10 @@ double probe_duration_seconds(const fs::path& file) {
 
 RowMeta probe_row_meta(const fs::path& file) {
     RowMeta rm;
-    std::string cmd = "ffprobe -v error -show_entries format=duration:format_tags=artist "
-                       "-of default=noprint_wrappers=1 " + shell_quote(file.string());
-    ProcResult r = run_capture(cmd);
+    ProcResult r = run_capture({"ffprobe", "-v", "error",
+                                "-show_entries", "format=duration:format_tags=artist",
+                                "-of", "default=noprint_wrappers=1",
+                                path_utf8(file)});
     if (r.out.empty()) return rm;
 
     std::istringstream stream(r.out);
@@ -68,10 +71,11 @@ TrackMetadata probe_metadata(const fs::path& file, const std::string& fallback_n
         md.file_size = oss.str();
     }
 
-    std::string cmd = "ffprobe -v error "
-                       "-show_entries format=duration:format_tags=artist,date,title:stream=sample_rate,codec_name "
-                       "-of default=noprint_wrappers=1 " + shell_quote(file.string());
-    ProcResult r = run_capture(cmd);
+    ProcResult r = run_capture({"ffprobe", "-v", "error",
+                                "-show_entries",
+                                "format=duration:format_tags=artist,date,title:stream=sample_rate,codec_name",
+                                "-of", "default=noprint_wrappers=1",
+                                path_utf8(file)});
     if (!r.ok() && r.out.empty()) return md;
 
     std::istringstream stream(r.out);

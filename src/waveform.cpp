@@ -1,16 +1,12 @@
 #include "waveform.h"
+#include "path_utf8.h"
 #include "process_util.h"
 #include "miniaudio.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
-#include <fcntl.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-extern char** environ;
+#include <vector>
 
 namespace muisc {
 
@@ -133,7 +129,15 @@ static bool stream_decode_miniaudio(const fs::path& file_path, StreamingPcm& pcm
                                      const std::function<void(const float*, size_t)>& on_chunk) {
     ma_decoder decoder;
     ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, 44100);
+#ifdef _WIN32
+    // ma_decoder_init_file takes a narrow path, which miniaudio converts using
+    // the process ANSI code page -- so a track called "Пример.flac" simply
+    // fails to open and falls through to the much slower ffmpeg path, or fails
+    // outright. The _w variant takes UTF-16 and opens it correctly.
+    if (ma_decoder_init_file_w(file_path.wstring().c_str(), &config, &decoder) != MA_SUCCESS) {
+#else
     if (ma_decoder_init_file(file_path.string().c_str(), &config, &decoder) != MA_SUCCESS) {
+#endif
         return false; // let the caller fall back to the ffmpeg path (e.g. Opus, which this can't touch)
     }
 
@@ -152,52 +156,30 @@ static bool stream_decode_miniaudio(const fs::path& file_path, StreamingPcm& pcm
 }
 
 // Fallback for formats miniaudio's built-in decoders don't cover — Opus
-// (yt-dlp's cache format) being the main one this project actually needs.
-// Was hardcoding "/bin/sh" here, which doesn't exist on Termux (its whole
-// filesystem lives under its own prefix, not the standard FHS layout) —
-// posix_spawn would just fail outright with no diagnostic the user could
-// see, meaning decode silently never happened. posix_spawnp with a bare
-// "sh" resolves through PATH instead, which finds Termux's shell
-// wherever it actually lives.
+// (yt-dlp's cache format) being the main one this project actually needs,
+// which makes this the hot path for every YouTube-sourced track.
+//
+// There is no shell involved any more on any platform: this used to build an
+// `sh -c` line, which meant hardcoding "/bin/sh" (absent on Termux, whose
+// filesystem lives under its own prefix rather than the standard FHS layout)
+// and later a bare "sh" resolved through PATH. Windows has neither, so the
+// spawn moved wholesale into ChildProcess and the command became an argv.
 static void stream_decode_ffmpeg_fallback(const fs::path& file_path, StreamingPcm& pcm,
                                            const std::function<void(const float*, size_t)>& on_chunk) {
     // -nostdin: tells ffmpeg outright not to expect interactive
-    // keyboard input. Belt-and-suspenders -- the real fix is the stdin
-    // redirect below, which means ffmpeg never even sees our terminal's
-    // fd, but this makes the intent explicit and costs nothing.
-    std::string cmd = "ffmpeg -nostdin -v error -i " + shell_quote(file_path.string())
-                     + " -f f32le -ac 1 -ar 44100 -";
-
-    int out_pipe[2];
-    if (pipe(out_pipe) != 0) {
-        pcm.decode_failed.store(true);
-        pcm.decode_done.store(true);
-        return;
-    }
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    // See process_util.cpp's run_capture() for the full explanation --
-    // this was the actual freeze bug: ffmpeg inheriting the terminal's
-    // raw-mode stdin and, on exit, leaving it back in canonical mode,
-    // turning our non-blocking key read into a blocking one. This path
-    // in particular is hit on essentially every YouTube-sourced Opus
-    // track, since the primary in-process decoder can't handle Opus and
-    // always falls back to here.
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
-    posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addclose(&actions, out_pipe[1]);
-
-    const char* argv[] = {"sh", "-c", cmd.c_str(), nullptr};
-    pid_t pid = -1;
-    int rc = posix_spawnp(&pid, "sh", &actions, nullptr, const_cast<char* const*>(argv), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(out_pipe[1]);
-
-    if (rc != 0) {
-        close(out_pipe[0]);
+    // keyboard input. Belt-and-suspenders -- the real fix is that
+    // ChildProcess hands every child a stdin of /dev/null (NUL on
+    // Windows), so ffmpeg never even sees our terminal's fd, but this
+    // makes the intent explicit and costs nothing.
+    // The spawn itself -- pipe setup, a stdin that can never be our terminal,
+    // and (on Windows) the job object that stops this ffmpeg outliving us --
+    // now lives in ChildProcess, shared with run_capture(). Upstream carried a
+    // second, near-identical copy of all of it here purely because this call
+    // site needs to read incrementally rather than to EOF.
+    auto child = ChildProcess::spawn({"ffmpeg", "-nostdin", "-v", "error",
+                                      "-i", path_utf8(file_path),
+                                      "-f", "f32le", "-ac", "1", "-ar", "44100", "-"});
+    if (!child) {
         pcm.decode_failed.store(true);
         pcm.decode_done.store(true);
         return;
@@ -211,8 +193,8 @@ static void stream_decode_ffmpeg_fallback(const fs::path& file_path, StreamingPc
     char carry[sizeof(float) - 1];
     size_t carry_len = 0;
     std::array<char, 65536> buf{};
-    ssize_t n;
-    while ((n = read(out_pipe[0], buf.data(), buf.size())) > 0) {
+    long long n;
+    while ((n = child->read_stdout(buf.data(), buf.size())) > 0) {
         // Prepend any bytes left from the previous read.
         size_t total = carry_len + static_cast<size_t>(n);
         size_t whole_floats = total / sizeof(float);
@@ -247,11 +229,8 @@ static void stream_decode_ffmpeg_fallback(const fs::path& file_path, StreamingPc
                 carry[carry_len++] = buf[i];
         }
     }
-    close(out_pipe[0]);
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0) && pcm.available.load() == 0) {
+    int exit_code = child->wait();
+    if (exit_code != 0 && pcm.available.load() == 0) {
         pcm.decode_failed.store(true);
     }
     pcm.decode_done.store(true);
