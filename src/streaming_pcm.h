@@ -22,18 +22,39 @@ namespace muisc {
 // usually right) truncates the last bit of a track rather than risking
 // a use-after-free on a mid-playback reallocation touched by another
 // thread. That trade is worth it here.
+// Every decode path produces this many interleaved channels, and the output
+// device is opened with the same count. Upstream was mono end-to-end -- the
+// ffmpeg path passed -ac 1 and miniaudio was configured for one channel -- so
+// every stereo source, local FLAC included, was flattened before it was ever
+// heard. One constant so the decoders, the device and the buffer can never
+// disagree about the layout.
+inline constexpr int kAudioChannels = 2;
+
 struct StreamingPcm {
-    std::vector<float> data;
-    std::atomic<size_t> available{0};   // frames safe to read right now
+    std::vector<float> data;            // interleaved: L R L R ...
+    std::atomic<size_t> available{0};   // SAMPLES safe to read (frames * channels)
     std::atomic<bool> decode_done{false};
     std::atomic<bool> decode_failed{false};
     std::atomic<bool> capacity_exceeded{false}; // diagnostic only
     int sample_rate = 44100;
+    int channels = kAudioChannels;
 
-    void reserve_for_seconds(double seconds, int sr) {
+    // `available` and `data.size()` count samples, not frames; divide by
+    // channels to get a frame index. Kept as samples because that is the unit
+    // append() works in and the unit the lock-free publish protects.
+    size_t frames_available() const {
+        int ch = channels > 0 ? channels : 1;
+        return available.load(std::memory_order_acquire) / static_cast<size_t>(ch);
+    }
+
+    void reserve_for_seconds(double seconds, int sr, int ch = kAudioChannels) {
         sample_rate = sr;
-        size_t est = static_cast<size_t>(std::max(1.0, seconds) * sr * 1.25); // 25% headroom
-        data.reserve(std::max<size_t>(est, static_cast<size_t>(sr) * 5)); // at least 5s worth
+        channels = ch > 0 ? ch : 1;
+        // Stereo doubles this: roughly 105 MB for a five-minute track before
+        // the headroom, 132 MB with it. That is the cost of not downmixing,
+        // and it is paid per track, not cumulatively.
+        size_t est = static_cast<size_t>(std::max(1.0, seconds) * sr * channels * 1.25); // 25% headroom
+        data.reserve(std::max<size_t>(est, static_cast<size_t>(sr) * channels * 5)); // at least 5s worth
     }
 
     // Decode thread only.

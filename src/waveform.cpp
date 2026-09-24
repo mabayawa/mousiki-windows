@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace muisc {
@@ -128,7 +129,8 @@ std::vector<int> WaveformQuantizer::resample_for_ui(const std::vector<float>& hi
 static bool stream_decode_miniaudio(const fs::path& file_path, StreamingPcm& pcm,
                                      const std::function<void(const float*, size_t)>& on_chunk) {
     ma_decoder decoder;
-    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, 44100);
+    // Decode to the pipeline's channel layout rather than folding to mono.
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, kAudioChannels, 44100);
 #ifdef _WIN32
     // ma_decoder_init_file takes a narrow path, which miniaudio converts using
     // the process ANSI code page -- so a track called "Пример.flac" simply
@@ -141,13 +143,18 @@ static bool stream_decode_miniaudio(const fs::path& file_path, StreamingPcm& pcm
         return false; // let the caller fall back to the ffmpeg path (e.g. Opus, which this can't touch)
     }
 
-    float buf[4096];
+    // ma_decoder_read_pcm_frames counts FRAMES, not samples, so the buffer has
+    // to hold frames * channels floats. Asking for 4096 frames into a
+    // 4096-float buffer was safe only while this was mono.
+    constexpr size_t kBufFrames = 4096 / kAudioChannels;
+    float buf[kBufFrames * kAudioChannels];
     ma_uint64 frames_read = 0;
     for (;;) {
-        ma_result result = ma_decoder_read_pcm_frames(&decoder, buf, 4096, &frames_read);
+        ma_result result = ma_decoder_read_pcm_frames(&decoder, buf, kBufFrames, &frames_read);
         if (frames_read > 0) {
-            pcm.append(buf, static_cast<size_t>(frames_read));
-            if (on_chunk) on_chunk(buf, static_cast<size_t>(frames_read));
+            size_t samples = static_cast<size_t>(frames_read) * kAudioChannels;
+            pcm.append(buf, samples);
+            if (on_chunk) on_chunk(buf, samples);
         }
         if (result != MA_SUCCESS || frames_read == 0) break;
     }
@@ -178,7 +185,8 @@ static void stream_decode_ffmpeg_fallback(const fs::path& file_path, StreamingPc
     // site needs to read incrementally rather than to EOF.
     auto child = ChildProcess::spawn({"ffmpeg", "-nostdin", "-v", "error",
                                       "-i", path_utf8(file_path),
-                                      "-f", "f32le", "-ac", "1", "-ar", "44100", "-"});
+                                      "-f", "f32le", "-ac", std::to_string(kAudioChannels),
+                                      "-ar", "44100", "-"});
     if (!child) {
         pcm.decode_failed.store(true);
         pcm.decode_done.store(true);
