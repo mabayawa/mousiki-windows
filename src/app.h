@@ -19,6 +19,7 @@
 #include "player.h"
 #include "settings.h"
 #include "snapshot.h"
+#include "spotify_source.h"
 #include "sphere_visualizer.h"
 #include "streaming_pcm.h"
 #include "terminal_ui.h"
@@ -49,6 +50,7 @@ private:
     CacheManager cache_;
     YoutubeSource youtube_{cache_};
     OnlineSource online_;
+    SpotifySource spotify_;
     LocalSource local_source_;
     DiskArt disk_;
     mutable Player player_;
@@ -369,7 +371,9 @@ private:
     std::atomic<bool> search_ready_{false};
     std::atomic<bool> search_in_progress_{false};
     std::vector<OnlineResult> pending_search_results_;
+    std::string pending_search_error_;   // guarded by search_mutex_
     void launch_search_async(const std::string& query);
+    void launch_spotify_search_async(const std::string& query);
     void poll_pending_search();
 
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---

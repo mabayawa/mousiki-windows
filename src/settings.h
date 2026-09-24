@@ -150,6 +150,13 @@ struct Settings {
     // (~/Music and ~/disk/Music).
     std::vector<std::string> local_music_paths;
 
+    // --- Spotify ---
+    // Blank client id disables the feature entirely, which is the default:
+    // the id belongs to whoever runs mousiki, not to the repository.
+    std::string spotify_client_id;
+    // Blank means "find librespot on PATH".
+    std::string spotify_librespot_path;
+
     // --- hotkey mapping ------------------------------------------------
     // Action name → key string (e.g. "ARROW_KEY_UP", "s", "ENTER")
     std::unordered_map<std::string, std::string> hotkeys;

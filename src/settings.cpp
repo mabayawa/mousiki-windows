@@ -658,6 +658,21 @@ static Settings load_from_config(const fs::path& path) {
         if (key == "AutoSaveC1") { if (!unquote(value).empty()) s.autosave_c1 = normalize_color_value(unquote(value)); continue; }
         if (key == "AutoSaveC2") { if (!unquote(value).empty()) s.autosave_c2 = normalize_color_value(unquote(value)); continue; }
 
+        // --- Spotify ---
+        if (key == "SpotifyClientId" || key == "spotify_client_id") {
+            s.spotify_client_id = trim(unquote(value));
+            continue;
+        }
+        if (key == "SpotifyLibrespotPath" || key == "spotify_librespot_path") {
+            std::string p = trim(unquote(value));
+            if (!p.empty() && p[0] == '~') {
+                const char* home = std::getenv("HOME");
+                if (home) p = std::string(home) + p.substr(1);
+            }
+            s.spotify_librespot_path = p;
+            continue;
+        }
+
         // --- Local music library paths ---
         // Each LocalMusicPath= line appends one directory.
         // A leading ~ is expanded to $HOME so users can write:
@@ -895,6 +910,12 @@ void save_settings(const Settings& s) {
         std::string setting_key = s.hotkeys.count("HKeySetting") ? s.hotkeys.at("HKeySetting") : "s";
         out << "HKeySetting=\"" << setting_key << "\"\n";
     }
+    // Written back explicitly. save_settings() runs on every clean quit and
+    // only persists the keys it knows about, so anything omitted here is
+    // silently deleted from the user's config the first time they exit.
+    out << "\n# Spotify\n";
+    out << "SpotifyClientId=" << s.spotify_client_id << "\n";
+    out << "SpotifyLibrespotPath=" << s.spotify_librespot_path << "\n";
     out << "\n# Local Music Paths\n";
     for (const auto& path : s.local_music_paths) {
         out << "LocalMusicPath=" << path << "\n";

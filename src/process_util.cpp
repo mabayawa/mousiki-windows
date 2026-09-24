@@ -20,6 +20,14 @@ extern char** environ;
 
 namespace muisc {
 
+std::vector<std::string> python_argv() {
+#ifdef _WIN32
+    return win_python_argv();
+#else
+    return {"python3"};
+#endif
+}
+
 std::string describe_argv(const std::vector<std::string>& argv) {
     std::string out;
     for (size_t i = 0; i < argv.size(); ++i) {

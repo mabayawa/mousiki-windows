@@ -53,6 +53,14 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// argv for invoking Python, or empty if no usable interpreter exists.
+//
+// Upstream hardcoded "python3", which is not how Python is named on Windows:
+// the usual entry point is the `py` launcher, and a bare `python` may be the
+// Microsoft Store alias stub that opens the Store instead of running anything.
+// Shared because both the lyrics helper and the Spotify helper need it.
+std::vector<std::string> python_argv();
+
 // Renders an argv as a human-readable line for the console log. This is for
 // display only -- it is never parsed or executed.
 std::string describe_argv(const std::vector<std::string>& argv);

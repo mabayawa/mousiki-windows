@@ -339,12 +339,12 @@ std::vector<std::string> render_lyric_line_wrapped(const LyricLine& line, double
     return out;
 }
 
-fs::path find_lyrics_script() {
+fs::path find_script(const char* filename) {
     if (const char* env = std::getenv("MOUSIKI_SCRIPTS_DIR")) {
-        fs::path p = fs::path(env) / "fetch_lyrics.py";
+        fs::path p = fs::path(env) / filename;
         if (fs::exists(p)) return p;
     }
-    fs::path cwd_candidate = fs::path("scripts") / "fetch_lyrics.py";
+    fs::path cwd_candidate = fs::path("scripts") / filename;
     if (fs::exists(cwd_candidate)) return cwd_candidate;
 
 #if defined(_WIN32)
@@ -355,9 +355,9 @@ fs::path find_lyrics_script() {
         std::string exe = win_executable_path();
         if (!exe.empty()) {
             fs::path exe_dir = path_from_utf8(exe).parent_path();
-            fs::path p = exe_dir / "scripts" / "fetch_lyrics.py";
+            fs::path p = exe_dir / "scripts" / filename;
             if (fs::exists(p)) return p;
-            p = exe_dir.parent_path() / "scripts" / "fetch_lyrics.py";
+            p = exe_dir.parent_path() / "scripts" / filename;
             if (fs::exists(p)) return p;
         }
     }
@@ -368,9 +368,9 @@ fs::path find_lyrics_script() {
         std::error_code ec;
         fs::path exe_dir = fs::canonical(fs::path(exe_buf), ec).parent_path();
         if (!ec) {
-            fs::path p = exe_dir / "scripts" / "fetch_lyrics.py";
+            fs::path p = exe_dir / "scripts" / filename;
             if (fs::exists(p)) return p;
-            p = exe_dir.parent_path() / "scripts" / "fetch_lyrics.py";
+            p = exe_dir.parent_path() / "scripts" / filename;
             if (fs::exists(p)) return p;
         }
     }
@@ -380,9 +380,9 @@ fs::path find_lyrics_script() {
     if (n > 0) {
         exe_buf[n] = '\0';
         fs::path exe_dir = fs::path(exe_buf).parent_path();
-        fs::path p = exe_dir / "scripts" / "fetch_lyrics.py";
+        fs::path p = exe_dir / "scripts" / filename;
         if (fs::exists(p)) return p;
-        p = exe_dir.parent_path() / "scripts" / "fetch_lyrics.py";
+        p = exe_dir.parent_path() / "scripts" / filename;
         if (fs::exists(p)) return p;
     }
 #endif
@@ -393,7 +393,9 @@ fs::path find_lyrics_script() {
 
 App::App() {
     settings_ = load_settings();
-    lyrics_script_ = find_lyrics_script();
+    lyrics_script_ = find_script("fetch_lyrics.py");
+    // Blank client id leaves spotify_.enabled() false and the feature inert.
+    spotify_.configure(settings_.spotify_client_id, find_script("spotify.py"));
     
     // Inject the cache directory into local music paths so streamed songs
     // automatically appear in the local view for seamless offline playback
@@ -561,7 +563,8 @@ void App::update_live_search_preview() {
     while (!buf.empty() && buf.front() == ' ') buf.erase(buf.begin());
     while (!buf.empty() && buf.back() == ' ') buf.pop_back();
 
-    if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") {
+    if ((buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") ||
+        (buf.size() >= 3 && lower(buf.substr(0, 3)) == "sp:")) {
         list_source_ = pre_search_list_source_;
         local_view_ = filter_and_rank_local(pre_search_local_query_);
         selected_ = 0;
@@ -580,6 +583,23 @@ void App::submit_search() {
     // trim
     while (!buf.empty() && buf.front() == ' ') buf.erase(buf.begin());
     while (!buf.empty() && buf.back() == ' ') buf.pop_back();
+
+    if (buf.size() >= 3 && lower(buf.substr(0, 3)) == "sp:") {
+        std::string query = buf.substr(3);
+        while (!query.empty() && query.front() == ' ') query.erase(query.begin());
+        if (!spotify_.enabled()) {
+            status_line_ = "spotify: set SpotifyClientId in config.txt first";
+            return;
+        }
+        last_online_query_ = query;
+        list_source_ = ListSource::Online;
+        if (search_in_progress_.load()) {
+            status_line_ = "still searching, hang on ...";
+            return;
+        }
+        launch_spotify_search_async(query);
+        return;
+    }
 
     if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") {
         std::string query = buf.substr(2);
@@ -662,7 +682,18 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
             load_stage_ = 1;
             auto t0 = clock::now();
             std::string err;
-            auto resolved = youtube_.resolve_by_id(video_id, title, artist, &err);
+            std::optional<SongResult> resolved;
+            if (video_id.empty()) {
+                // A metadata-only result -- a Spotify track, which has no
+                // YouTube id. Search for one using what the user would have
+                // typed themselves. This is the "option A" path: Spotify
+                // supplies the library, YouTube supplies the audio.
+                std::string q = title;
+                if (!artist.empty()) q += " " + artist;
+                resolved = youtube_.resolve(q, &err);
+            } else {
+                resolved = youtube_.resolve_by_id(video_id, title, artist, &err);
+            }
             t_resolve = elapsed_s(t0);
             if (!resolved) {
                 pl.error = "download failed: " + err;
@@ -911,12 +942,42 @@ void App::launch_search_async(const std::string& query) {
     });
 }
 
+// Same shape as launch_search_async, but the results come from Spotify. They
+// are OnlineResults either way, so poll_pending_search() and the online list
+// view need no changes at all -- a Spotify row simply carries a spotify_uri
+// and an empty video_id.
+void App::launch_spotify_search_async(const std::string& query) {
+    if (search_thread_.joinable()) search_thread_.join();
+    search_in_progress_ = true;
+    search_ready_ = false;
+    status_line_ = "searching spotify for \"" + query + "\" ...";
+
+    search_thread_ = std::thread([this, query]() {
+        std::vector<OnlineResult> results;
+        std::string err;
+        try {
+            results = spotify_.search(query, &err);
+        } catch (const std::exception& e) {
+            err = std::string("spotify: ") + e.what();
+        } catch (...) {
+            err = "spotify: unknown error";
+        }
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        pending_search_results_ = std::move(results);
+        pending_search_error_ = err;
+        search_ready_ = true;
+    });
+}
+
 void App::poll_pending_search() {
     if (!search_ready_.load()) return;
     std::vector<OnlineResult> results;
+    std::string err;
     {
         std::lock_guard<std::mutex> lk(search_mutex_);
         results = std::move(pending_search_results_);
+        err = std::move(pending_search_error_);
+        pending_search_error_.clear();
     }
     search_ready_ = false;
     search_in_progress_ = false;
@@ -924,7 +985,8 @@ void App::poll_pending_search() {
     online_view_ = std::move(results);
     selected_ = 0;
     scroll_ = 0;
-    status_line_ = online_view_.empty() ? "no online results" : "";
+    if (!err.empty() && online_view_.empty()) status_line_ = err;
+    else status_line_ = online_view_.empty() ? "no online results" : "";
 }
 
 void App::play_selected() {
@@ -1559,6 +1621,17 @@ void App::start_local_track(const LocalTrack& track) {
 
 void App::start_online_track(const OnlineResult& result) {
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
+
+    if (!result.spotify_uri.empty()) {
+        // Spotify gives a clean title and a real artist field, unlike a
+        // YouTube video title, so both are worth passing on: the YouTube
+        // search below uses them to find the audio, and the lyrics lookup
+        // gets a far better query than it would from a raw video title.
+        launch_load_async({}, result.title, result.uploader, "spotify",
+                          /*is_local=*/false, /*video_id=*/"");
+        return;
+    }
+
     // Pass "" for artist so the lyrics search queries just the YouTube video title
     // (which usually contains "Artist - Song Name" perfectly), instead of appending the channel name.
     launch_load_async({}, result.title, "", "youtube", /*is_local=*/false, result.video_id);

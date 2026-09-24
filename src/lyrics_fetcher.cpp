@@ -14,18 +14,6 @@
 
 namespace muisc {
 
-// Upstream hardcodes "python3", which is not how Python is named on Windows:
-// the usual entry point is the `py` launcher, and a bare `python` may be the
-// Microsoft Store alias stub that launches the Store instead of an
-// interpreter. win_python_argv() resolves that properly.
-static std::vector<std::string> python_argv() {
-#ifdef _WIN32
-    return win_python_argv();
-#else
-    return {"python3"};
-#endif
-}
-
 
 // Sidecar lyrics file lives next to the track, same stem, .lrc extension —
 // e.g. "Song Title.opus" -> "Song Title.lrc". Works for both a user's own
