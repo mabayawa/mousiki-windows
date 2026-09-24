@@ -117,10 +117,17 @@ jobs:
               missing=1
             fi
           done
-          # Password auth was removed upstream; if it ever comes back, the
-          # OAuth-only assumption in spotify.py's docs needs revisiting.
-          if grep -q -- "--password" help.txt; then
-            echo "::warning::--password is present again; revisit the auth notes"
+          # Assert the OAuth-only assumption by BEHAVIOUR, not by grepping help.
+          # 0.8.0 still LISTS --password in --help, but using it exits 1 with
+          # "Password authentication no longer supported, use OAuth" -- it is a
+          # deprecation stub. Matching on the help text just reports that stub
+          # forever; running it is what would actually notice password auth
+          # coming back and invalidating the OAuth design in spotify.py.
+          if "$bin" --password hunter2 --username nobody --backend pipe 2>&1 |
+               grep -qi "no longer supported"; then
+            echo "  ok      --password is rejected (OAuth-only, as designed)"
+          else
+            echo "::warning::--password no longer rejects; revisit the auth notes in spotify.py"
           fi
           if [ "$missing" -ne 0 ]; then
             echo "::error::librespot ${{ steps.ver.outputs.version }} is missing flags mousiki relies on"
