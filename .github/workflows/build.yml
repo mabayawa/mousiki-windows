@@ -16,8 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No -G here on purpose. Pinning "Visual Studio 17 2022" breaks whenever
+      # the runner image moves to a newer Visual Studio, which is exactly what
+      # happened; with no generator named, CMake selects the newest one it
+      # actually finds installed.
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release --parallel
