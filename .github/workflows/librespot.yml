@@ -1,0 +1,200 @@
+name: librespot
+
+# Builds the librespot binary that mousiki downloads for Spotify audio.
+#
+# Why this exists at all: librespot-org publishes NO prebuilt binaries. Every
+# release on GitHub has zero assets (the "Assets 2" the web UI shows is the
+# auto-generated source archive), so there is nothing upstream to download.
+# Asking users to install a Rust toolchain just to hear a track is a real
+# adoption cliff, so we build it here, once, and publish it with a checksum.
+#
+# Deliberately NOT part of the per-push `build` workflow: a librespot build
+# takes on the order of ten minutes, and it only changes when the pinned
+# version does. Run it by hand, or push a librespot-v* tag.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: librespot crate version to build
+        required: true
+        default: "0.8.0"
+  push:
+    tags: ["librespot-v*"]
+
+permissions:
+  contents: write # attach the built binaries to a release
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x86_64
+            exe: librespot.exe
+            asset: librespot-windows-x86_64.exe
+          # mousiki is not a Windows-only project (see the comment at the top of
+          # build.yml), so the daemon it downloads should not be either.
+          - os: ubuntu-latest
+            label: Linux x86_64
+            exe: librespot
+            asset: librespot-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the version to build
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            v="${{ inputs.version }}"
+          else
+            # librespot-v0.8.0 -> 0.8.0
+            v="${GITHUB_REF_NAME#librespot-v}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "building librespot $v"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: librespot-${{ steps.ver.outputs.version }}
+
+      # Needed only by the fallback build below, which compiles librespot's
+      # default audio backends. The minimal build wants neither.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libssl-dev
+
+      # mousiki only ever uses `--backend pipe`, which librespot compiles in
+      # unconditionally. So the minimal feature set is enough and avoids cpal,
+      # ALSA and mDNS entirely -- a smaller binary and a faster build.
+      #
+      # The fallback is not laziness: librespot's TLS feature names have moved
+      # between releases, and this workflow is meant to keep working when the
+      # pinned version is bumped. If the minimal set does not resolve, build the
+      # default one and say so in the log rather than failing the release.
+      - name: Build (minimal features, falling back to default)
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          v="${{ steps.ver.outputs.version }}"
+          if cargo install librespot --version "$v" --locked --root out \
+               --no-default-features --features native-tls 2>&1 | tee build.log; then
+            echo "features=no-default+native-tls" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::minimal feature set failed; retrying with librespot's defaults"
+            rm -rf out
+            cargo install librespot --version "$v" --locked --root out 2>&1 | tee -a build.log
+            echo "features=default" >> "$GITHUB_OUTPUT"
+          fi
+
+      # This is the part that earns the job its keep beyond just producing a
+      # binary. mousiki's design depends on a specific set of flags existing and
+      # meaning what we think they mean; asserting them here turns a one-off
+      # manual check into a permanent gate, so a version bump that drops or
+      # renames one fails HERE instead of at a user's first Spotify track.
+      - name: Assert the flags mousiki depends on still exist
+        shell: bash
+        run: |
+          bin="out/bin/${{ matrix.exe }}"
+          test -x "$bin" || { echo "no binary at $bin"; exit 1; }
+          "$bin" --help > help.txt 2>&1 || true
+          missing=0
+          for flag in --backend --device --format --bitrate --name --cache \
+                      --disable-audio-cache --disable-discovery --autoplay \
+                      --volume-ctrl --initial-volume --enable-oauth; do
+            if grep -q -- "$flag" help.txt; then
+              echo "  ok      $flag"
+            else
+              echo "  MISSING $flag"
+              missing=1
+            fi
+          done
+          # Password auth was removed upstream; if it ever comes back, the
+          # OAuth-only assumption in spotify.py's docs needs revisiting.
+          if grep -q -- "--password" help.txt; then
+            echo "::warning::--password is present again; revisit the auth notes"
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::librespot ${{ steps.ver.outputs.version }} is missing flags mousiki relies on"
+            sed -n '1,120p' help.txt
+            exit 1
+          fi
+          # `pipe` must be a compiled-in backend or there is no PCM to read.
+          "$bin" --backend '?' > backends.txt 2>&1 || true
+          grep -qi pipe backends.txt || grep -qi pipe help.txt || {
+            echo "::error::the pipe backend is not available in this build"
+            cat backends.txt; exit 1; }
+          echo "pipe backend present"
+
+      - name: Stage the asset and its checksum
+        id: stage
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "out/bin/${{ matrix.exe }}" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256"
+            sum=$(sha256sum "${{ matrix.asset }}" | cut -d' ' -f1)
+          else
+            sum=$(certutil -hashfile "${{ matrix.asset }}" SHA256 | sed -n 2p | tr -d ' \r')
+            echo "$sum  ${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256"
+          fi
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "size=$(wc -c < "${{ matrix.asset }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.label }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| features | \`${{ steps.build.outputs.features }}\` |"
+            echo "| asset | \`${{ matrix.asset }}\` |"
+            echo "| size | ${{ steps.stage.outputs.size }} bytes |"
+            echo "| sha256 | \`${{ steps.stage.outputs.sha256 }}\` |"
+            echo ""
+            echo "Paste the URL and sha256 into \`LIBRESPOT_BUILDS\` in \`scripts/spotify.py\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Attach to a release
+    needs: build
+    # Only for a tag push: a manual run is for testing a version bump, and
+    # should not silently publish anything.
+    if: startsWith(github.ref, 'refs/tags/librespot-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          body: |
+            librespot built for mousiki, because upstream publishes no binaries.
+
+            Verify before use — `scripts/spotify.py ensure-librespot` refuses any
+            download whose SHA-256 does not match its pinned value, and refuses
+            outright when no pin exists. The `.sha256` files here are those values.
