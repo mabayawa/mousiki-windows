@@ -104,6 +104,29 @@ AutoSaveC1=
 AutoSaveC2=
 
 ##-------------------------------------------
+##                  SPOTIFY
+##-------------------------------------------
+
+SpotifyClientId=
+## Leave blank to disable Spotify entirely.
+##
+## To enable it, register a free app at https://developer.spotify.com/dashboard
+## and paste its Client ID here. Add exactly this redirect URI to the app:
+##     http://127.0.0.1:8888/callback
+## It must be 127.0.0.1 -- Spotify rejects "localhost" outright.
+##
+## The Client ID is not a secret; it is designed to ship inside desktop apps.
+## The client SECRET is, and mousiki never asks for it: auth uses PKCE, which
+## exists so an app running on your machine does not have to store one.
+##
+## Spotify audio requires Premium and the librespot binary. Without librespot,
+## a Client ID still gets you your playlists and Liked Songs, played back
+## through the normal online-search path.
+
+SpotifyLibrespotPath=
+## Path to librespot.exe. Blank means "find it on PATH".
+
+##-------------------------------------------
 ##             PANEL 4: REFERENCE
 ##-------------------------------------------
 

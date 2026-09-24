@@ -19,3 +19,6 @@ cmake_install.cmake
 
 # Local agent/tooling state
 .claude/
+
+# Spotify OAuth token cache (a bearer credential - never commit)
+spotify_token.json
