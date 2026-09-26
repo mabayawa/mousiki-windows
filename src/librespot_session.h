@@ -161,6 +161,10 @@ private:
     std::atomic<bool> resync_{false};
     std::atomic<State> state_{State::Idle};
     std::atomic<long long> written_cur_{0};
+    // Bumped by reset_plan(). The reader snapshots it with the plan, so a read
+    // that was already in flight when the plan was replaced can tell that its
+    // bytes belong to a plan that no longer exists.
+    std::atomic<int> plan_epoch_{0};
     std::atomic<int> boundary_seq_{0};
     std::atomic<long long> last_byte_ms_{0};
 

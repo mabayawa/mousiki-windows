@@ -236,6 +236,7 @@ void LibrespotSession::reset_plan(LibrespotTrack first) {
     // Counts absolute track frames, so a post-seek stream starts where it
     // actually belongs rather than at zero.
     written_cur_.store(origin, std::memory_order_release);
+    plan_epoch_.fetch_add(1, std::memory_order_release);
 }
 
 void LibrespotSession::append_plan(LibrespotTrack next) {
@@ -266,6 +267,11 @@ void LibrespotSession::reader_main() {
     if (!proc) return;
     std::array<char, kReadBytes> buf{};
     size_t carry_len = 0;
+    // Realignment padding owed to the stream: bytes to discard from the next
+    // read so that frame boundaries land where they actually are. Set by the
+    // resync drain below, which is the only thing that can consume a partial
+    // frame's worth of bytes without emitting it.
+    size_t skip_bytes = 0;
     // Aligned because the float view below is a reinterpret_cast over it; a
     // bare char array carries no such guarantee.
     alignas(alignof(float)) std::array<char, kReadBytes + 8> acc{};
@@ -278,8 +284,10 @@ void LibrespotSession::reader_main() {
         // librespot stops. It is also why a stall must never be read as EOF.
         std::shared_ptr<DecodeSession> sess;
         long long expected = 0;
+        int epoch = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            epoch = plan_epoch_.load(std::memory_order_acquire);
             if (!plan_.empty()) {
                 sess = plan_.front().session;
                 expected = plan_.front().frames_expected;
@@ -296,6 +304,7 @@ void LibrespotSession::reader_main() {
             // from hanging the reader.
             const long long deadline = now_ms() + 2000;
             long long last_data = now_ms();
+            long long dropped = 0;
             while (now_ms() < deadline && now_ms() - last_data < 250) {
                 const long long avail = proc->bytes_available();
                 if (avail < 0) break;
@@ -306,11 +315,38 @@ void LibrespotSession::reader_main() {
                 const long long n = proc->read_stdout(
                     buf.data(), std::min<size_t>(buf.size(), static_cast<size_t>(avail)));
                 if (n <= 0) break;
+                dropped += n;
                 last_data = now_ms();
             }
             // Dropped, not kept: half a frame from before the jump must not be
             // glued onto the first frame after it.
+            //
+            // But dropping a partial frame's worth of BYTES is not the same as
+            // dropping a whole number of frames, and only the second is safe.
+            // Frame boundaries here are positions in the byte stream, nothing
+            // more -- there are no markers (see the class comment) -- so the
+            // reader's idea of where a frame starts survives only if every byte
+            // it consumes without emitting is a multiple of the frame size.
+            // Neither half of what just got consumed is: bytes_available()
+            // reports whatever the OS pipe happens to hold (PeekNamedPipe /
+            // FIONREAD, no alignment guarantee), read_stdout may short-read on
+            // top of that, and carry_len is by definition a partial frame. So
+            // seven times in eight the stream resumed mid-frame and stayed
+            // shifted for the rest of the session -- audible as loud static.
+            // That is the same corruption the class comment describes for the
+            // 806-byte OAuth banner, reintroduced by the code that cleans up
+            // after a track switch or a seek, which is exactly when a user
+            // hears it: interrupt a playing track, get static.
+            //
+            // So account for both and owe the difference to the next read.
+            // Deliberately not a second read loop here: the caller has paused
+            // Spotify before asking for this, so a blocking read could park
+            // indefinitely -- the reason this drain is availability-polled at
+            // all. Carrying the remainder forward cannot block.
+            constexpr size_t kFrameBytes = kAudioChannels * sizeof(float);
+            const size_t orphaned = carry_len + static_cast<size_t>(dropped);
             carry_len = 0;
+            skip_bytes = (kFrameBytes - (orphaned % kFrameBytes)) % kFrameBytes;
             resync_.store(false, std::memory_order_release);
             continue;
         }
@@ -345,17 +381,43 @@ void LibrespotSession::reader_main() {
             state_.store(State::Ready, std::memory_order_release);
         }
 
+        // Realignment padding owed from a resync drain, discarded before any of
+        // it can be mistaken for the start of a frame.
+        size_t off = 0;
+        if (skip_bytes > 0) {
+            off = std::min(skip_bytes, static_cast<size_t>(n));
+            skip_bytes -= off;
+            if (off == static_cast<size_t>(n)) continue;   // the whole read was padding
+        }
+
+        // Was this read overtaken by a reset_plan()? The main thread fires
+        // set_reader_paused / request_resync / reset_plan back to back with no
+        // wait, and this thread can already be parked in read_stdout past both
+        // flag checks -- so these bytes can belong to a plan that no longer
+        // exists. Writing them would store written_cur_ over the origin
+        // reset_plan() just published, leaving the incoming track's
+        // (expected - written) room short by that much, so it stops being fed
+        // early and ends truncated.
+        //
+        // This suppresses only the WRITE. The frame accounting below still
+        // runs, so carry_len stays a partial frame and the stream stays
+        // aligned; dropping the bytes outright would leave them unaccounted and
+        // shift every frame after them, which is the bug the drain above just
+        // got fixed for.
+        const bool stale_plan = (plan_epoch_.load(std::memory_order_acquire) != epoch);
+
         // Reassemble whole frames across reads: at most (channels*4 - 1) bytes
         // are ever carried, and leftovers simply stay in the byte carry rather
         // than needing a second float-level buffer.
-        std::memcpy(acc.data() + carry_len, buf.data(), static_cast<size_t>(n));
-        const size_t total = carry_len + static_cast<size_t>(n);
+        const size_t got = static_cast<size_t>(n) - off;
+        std::memcpy(acc.data() + carry_len, buf.data() + off, got);
+        const size_t total = carry_len + got;
         const size_t floats = total / sizeof(float);
         const size_t usable = (floats / kAudioChannels) * kAudioChannels;
         const size_t used = usable * sizeof(float);
         carry_len = total - used;
 
-        if (usable > 0) {
+        if (usable > 0 && !stale_plan) {
             const float* samples = reinterpret_cast<const float*>(acc.data());
             size_t offset = 0;
             while (offset < usable) {
