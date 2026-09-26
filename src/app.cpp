@@ -646,9 +646,61 @@ void App::write_load_timing_log(const std::string& title, bool is_local, double 
     log << "\n";
 }
 
+void App::reset_per_track_ui_state() {
+    waveform_envelope_.clear();
+    waveform_ready_ = false;
+    waveform_scan_applied_ = false;
+    waveform_live_tick_ = 0;
+    last_lyrics_status_.clear();
+    // Don't let the previous track's spectrum tail linger into this one's
+    // first frame.
+    fft_.reset();
+    // Stop rendering the outgoing track's lyrics right now, and invalidate any
+    // fetch still in flight for it so it cannot land against the new track.
+    {
+        std::lock_guard<std::mutex> lk(lyrics_mutex_);
+        lyrics_ready_ = false;
+        ++lyrics_epoch_;
+    }
+}
+
+void App::begin_track_switch() {
+    // 1. Cut the audio and the clock together, before anything that can take
+    //    time. Lock-free and device-untouching -- see the comment on
+    //    Player::begin_track_switch() for why this is not stop().
+    const double cut_at = player_.poll_elapsed();
+    player_.begin_track_switch();
+
+    // 2. Whatever Spotify transport was live is not ours any more. This used
+    //    to be two bare flag clears in poll_pending_load(), which stopped
+    //    mousiki DISPLAYING a Connect track while the Connect device carried
+    //    on playing it.
+    stop_spotify_audio();
+
+    // 3. Kill the outgoing decoder here rather than at load completion, so its
+    //    ffmpeg child dies at the keypress instead of running alongside the
+    //    new one for the whole resolve. shutdown() kills the child before it
+    //    joins, and wait_for_room() polls the abort predicate, so this cannot
+    //    hang. The ring outlives this call -- Player holds its own shared_ptr
+    //    to it until the next play().
+    if (current_session_) { current_session_->shutdown(); current_session_.reset(); }
+    prefetch_valid_ = false;
+    prefetch_session_.reset();
+
+    reset_per_track_ui_state();
+
+    ConsoleLog::instance().log_verbose(
+        "audio: track switch -- cut at " + std::to_string(cut_at) + "s, clock zeroed");
+}
+
 void App::launch_load_async(fs::path local_path, std::string title, std::string artist,
                              std::string location_label, bool is_local, std::string video_id,
                              std::string spotify_uri) {
+    // FIRST, before the resolve+probe thread below -- which for an online
+    // track runs for seconds. This is the whole fix for the outgoing track
+    // staying audible and its position carrying over into the new track's
+    // progress bar, timestamp and lyrics.
+    begin_track_switch();
     if (load_thread_.joinable()) load_thread_.join(); // previous job already signaled done, safe to reap
     load_in_progress_ = true;
     load_ready_ = false;
@@ -766,8 +818,16 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
 // lyrics. Shared by the initial per-track fetch (poll_pending_load) and
 // the manual retry hotkey (handle_key's 'l' case).
 void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path path, bool force_network) {
-    lyrics_ready_ = false;
-    int my_epoch = ++lyrics_epoch_;
+    int my_epoch;
+    {
+        // Both under lyrics_mutex_, because the worker below tests the epoch
+        // while holding it. Bumped outside, a worker for the PREVIOUS track
+        // could take the mutex between the two statements, pass the epoch test
+        // and republish its lyrics against the track that just started.
+        std::lock_guard<std::mutex> lk(lyrics_mutex_);
+        lyrics_ready_ = false;
+        my_epoch = ++lyrics_epoch_;
+    }
     std::thread([this, title, artist, path, force_network, my_epoch]() {
         LyricsResult r = fetch_synced_lyrics(title, artist, path_utf8(lyrics_script_), path, force_network);
         std::lock_guard<std::mutex> lock(lyrics_mutex_);
@@ -867,25 +927,18 @@ void App::poll_pending_load() {
 
     if (!pl.success) {
         status_line_ = pl.error;
+        // begin_track_switch() already ended the outgoing track when this load
+        // started -- audio cut, decoder gone -- and there is no incoming track
+        // to replace it. Saying otherwise would draw a now-playing panel for
+        // silence, and would let the main loop's auto-advance run against it.
+        has_track_ = false;
         return;
     }
 
-    // Player::play() stops whatever it was previously playing as its own
-    // first step, so no separate explicit stop() call is needed here —
-    // and doing it inside play() (below, off the main thread) is what
-    // lets this whole switch never touch the main thread.
-    // Cancels the previous track's producer, scanner and their ffmpeg
-    // children, and joins them. This is the skip-actually-stops-decoding
-    // fix; before, the old decode simply ran on unnoticed.
-    // A locally decoded track is starting, so neither Spotify transport is
-    // live any more. Note librespot mode ALSO goes through current_session_,
-    // so this must not clobber a librespot track's own session -- hence the
-    // guard in launch_librespot_track(), which assigns after this runs.
-    spotify_remote_ = false;
-    spotify_librespot_ = false;
-    prefetch_valid_ = false;
-    prefetch_session_.reset();
-    if (current_session_) current_session_->shutdown();
+    // The outgoing track was already ended by begin_track_switch() when this
+    // load started: audio cut, clock zeroed, decoder shut down, Spotify
+    // transports paused, visualisers cleared. All that is left here is to
+    // adopt the track that just finished loading.
     current_session_ = pl.session;
     total_sec_ = pl.total_sec;
     metadata_ = pl.metadata;
@@ -895,12 +948,12 @@ void App::poll_pending_load() {
     current_spotify_uri_ = pl.spotify_uri;
     has_track_ = true;
     player_.clear_finished(); // see clear_finished()'s comment — closes the race that caused the double-skip bug
-    waveform_envelope_.clear();
-    waveform_ready_ = false;
-    waveform_scan_applied_ = false;
-    waveform_live_tick_ = 0;
-    last_lyrics_status_.clear();
-    fft_.reset(); // don't let the previous track's spectrum tail linger into this one's first frame
+
+    // The moment the UI becomes the new track. This must read 0.00s: anything
+    // else is the old track's position about to drive the new track's progress
+    // bar, timestamp and synced lyrics.
+    ConsoleLog::instance().log_verbose(
+        "audio: track handoff -- clock at " + std::to_string(player_.poll_elapsed()) + "s");
 
     launch_lyrics_fetch(pl.title, pl.artist, pl.path);
 
@@ -1822,8 +1875,23 @@ bool App::launch_librespot_track(const OnlineResult& r, double start_sec) {
     if (librespot_device_id_.empty()) return false;
 
     // Whatever was playing stops first, local or remote.
-    if (current_session_) { current_session_->shutdown(); current_session_.reset(); }
-    stop_spotify_audio();
+    begin_track_switch();
+
+    // The librespot child is ONE process for the whole session, so right now
+    // its stdout pipe can still hold up to 64 KiB of the PREVIOUS track's PCM.
+    // reset_plan() below only changes which session the reader writes into --
+    // without a resync those leftover bytes become the first samples of the
+    // new track's ring. The new song's clock then starts at 0 while its audio
+    // starts late by however much was buffered, and that offset never
+    // corrects: the timestamp and every lyric stay wrong by it for the whole
+    // song. seek_to() has always done this; this path never did.
+    // No spotify_ctl_.pause() here: begin_track_switch() -> stop_spotify_audio()
+    // already issued it, and only in the case where it does anything -- coming
+    // from a local track there is nothing playing on our device to pause, and
+    // the call would cost a Python subprocess and an HTTPS round trip to be
+    // told so.
+    librespot_.set_reader_paused(true);
+    librespot_.request_resync();
 
     const double dur = r.duration_sec > 0 ? r.duration_sec : 0.0;
     auto session = std::make_shared<DecodeSession>();
@@ -1854,11 +1922,6 @@ bool App::launch_librespot_track(const OnlineResult& r, double start_sec) {
     metadata_.name = r.title;
     metadata_.artist = r.uploader;
     metadata_.location = "spotify";
-    waveform_envelope_.clear();
-    waveform_ready_ = false;
-    waveform_scan_applied_ = false;
-    waveform_live_tick_ = 0;
-    fft_.reset();
     player_.clear_finished();
 
     // Tell Spotify to play it on OUR device. One uri here; the prefetch appends
@@ -2035,11 +2098,10 @@ bool App::adopt_prefetched_spotify() {
     metadata_.name = r.title;
     metadata_.artist = r.uploader;
     metadata_.location = "spotify";
-    waveform_envelope_.clear();
-    waveform_ready_ = false;
-    waveform_scan_applied_ = false;
-    waveform_live_tick_ = 0;
-    fft_.reset();
+    // The UI half only. Emphatically NOT begin_track_switch(): silencing the
+    // device and shutting down the session being adopted is the exact hole in
+    // the audio that gapless playback exists to remove.
+    reset_per_track_ui_state();
 
     // The whole point: swap the buffer under a RUNNING device. Going through
     // launch_device_play_async() would re-init it and put a hole in the audio
@@ -2094,9 +2156,10 @@ bool App::start_spotify_remote(const OnlineResult& r) {
     const std::string dev = pick_spotify_device();
     if (dev.empty()) return false;
 
-    // Nothing local is playing any more: stop the device and cancel any decode
-    // still running, or a previous track would keep going underneath Spotify.
-    if (current_session_) { current_session_->shutdown(); current_session_.reset(); }
+    // Nothing local is playing any more: cut the audio and the clock, cancel
+    // any decode still running, and pause whatever Spotify transport was live
+    // -- or a previous track would keep going underneath this one.
+    begin_track_switch();
     launch_device_stop_async();
 
     spotify_remote_ = true;
@@ -2122,11 +2185,8 @@ bool App::start_spotify_remote(const OnlineResult& r) {
     spotify_pos_at_ = std::chrono::steady_clock::now();
     spotify_state_at_ = spotify_pos_at_;
 
-    // No PCM ever reaches us in this mode, so nothing can drive these.
-    waveform_envelope_.clear();
-    waveform_ready_ = false;
-    waveform_scan_applied_ = false;
-    fft_.reset();
+    // No PCM ever reaches us in this mode, so nothing can drive the
+    // visualisers; begin_track_switch() already cleared them.
     player_.clear_finished();
 
     spotify_ctl_.play(dev, {r.spotify_uri});
@@ -2226,7 +2286,16 @@ void App::resolve_spotify_play(const OnlineResult& r) {
         spotify_devices_at_.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::seconds>(now - spotify_devices_at_).count() < 10;
 
-    if (fresh) { spotify_begin(r); return; }
+    if (fresh) {
+        // A device request from an earlier start may still be in flight. Drop
+        // the play it was going to trigger: otherwise poll_spotify() fires
+        // spotify_begin() for the OLDER track once the devices land, and it
+        // overrides the one starting here -- two starts interleaved, each
+        // shutting down whatever current_session_ points at by then.
+        spotify_play_pending_ = false;
+        spotify_begin(r);
+        return;
+    }
     pending_spotify_play_ = r;
     spotify_play_pending_ = true;
     spotify_ctl_.request_devices();
@@ -2249,7 +2318,10 @@ void App::spotify_begin(const OnlineResult& r) {
 // title and artist make a far better query than a raw video title, and the
 // lyrics lookup benefits from the real artist field too.
 void App::spotify_fallback_to_youtube(const OnlineResult& r) {
-    spotify_remote_ = false;
+    // Deliberately does NOT clear spotify_remote_ here. begin_track_switch(),
+    // reached through launch_load_async() below, only pauses the Connect
+    // device while that flag still says the device is ours -- clearing it
+    // first would silently orphan a device that is still playing.
     launch_load_async({}, r.title, r.uploader, "spotify",
                       /*is_local=*/false, /*video_id=*/"", r.spotify_uri);
 }

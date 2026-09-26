@@ -85,6 +85,31 @@ public:
     // past the track that was just supposed to start.
     void clear_finished() { finished_.store(false); }
 
+    // Ends the outgoing track's audio AND its clock immediately, from any
+    // thread, without touching the device.
+    //
+    // This exists because there was no single moment at which a track ended.
+    // Everything that actually stopped the previous one -- silencing the
+    // device, zeroing the cursor -- lived inside play(), which runs on the
+    // device worker and cannot start until the NEW track has finished
+    // resolving and probing. For an online track that is seconds. Until then
+    // the old audio stayed audible, and poll_elapsed() kept returning the old
+    // track's position while the UI had already switched to the new one -- so
+    // the progress bar, the timestamp and the synced lyrics all ran against a
+    // clock belonging to a song that was no longer on screen.
+    //
+    // Deliberately NOT stop(). That calls ma_device_uninit(), which is
+    // apartment-bound to the thread that created the device (see the COM note
+    // in app.h) and blocks for tens to hundreds of milliseconds; on the main
+    // thread it would freeze the render loop, which is the exact thing running
+    // device work off-thread exists to prevent. This is a single release store
+    // instead, and the callback honours it within one device period (~10 ms).
+    //
+    // Deliberately not paused_ either: that is user-visible state -- is_paused()
+    // drives the pause indicator and freezes the disk art -- and resume() would
+    // clear it out from under a switch that is still in flight.
+    void begin_track_switch();
+
     void stop();
 
 private:
@@ -109,6 +134,10 @@ private:
     std::atomic<bool> finished_{false};
     std::atomic<float> gain_{0.7f};
     std::atomic<bool> paused_{false};
+    // Set by begin_track_switch(), cleared by play()/adopt_ring() once the
+    // incoming ring is installed. While set, the callback emits silence and --
+    // the load-bearing half -- leaves cursor_frames_ and finished_ alone.
+    std::atomic<bool> switching_{false};
     std::atomic<int> volume_pct_{70};
     // Highest frame the producer has published, mirrored out of the ring by
     // the audio callback. The main thread needs this to decide whether a

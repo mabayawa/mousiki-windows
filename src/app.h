@@ -519,6 +519,24 @@ private:
     void play_relative(int delta);
     void play_relative_random();
     void advance_track();
+    // The single "the outgoing track ends NOW" moment, run on the main thread
+    // as the first act of every start path.
+    //
+    // Before this existed, each of the four start paths ended the previous
+    // track by hand, and none of them did it at the point the user actually
+    // asked. The audio stop and the clock reset both lived inside
+    // Player::play() on the device worker, which cannot run until the new
+    // track has finished resolving and probing -- seconds, for an online
+    // track. Everything in between was inconsistent: the old song still
+    // audible, the new song's title on screen, and the old song's position
+    // driving the new song's progress bar, timestamp and synced lyrics.
+    void begin_track_switch();
+    // The per-track UI state half of the above, without the audio cut.
+    // Split out for the gapless path: adopt_prefetched_spotify() must clear
+    // the visualisers but must NOT silence the device or shut down the
+    // session it is in the middle of adopting -- silence at an album boundary
+    // is the exact artefact gapless playback exists to remove.
+    void reset_per_track_ui_state();
     // Where the currently-playing track sits within *this list source's*
     // current view (local_view_ or online_view_, whichever list_source_
     // is showing), by identity match (path for local, video_id for
