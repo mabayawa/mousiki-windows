@@ -22,3 +22,8 @@ cmake_install.cmake
 
 # Spotify OAuth token cache (a bearer credential - never commit)
 spotify_token.json
+
+# Stray cache dir: anything that links these sources WITHOUT going through
+# main() misses win_bootstrap_env()'s HOME shim and resolves $HOME to ".",
+# dropping librespot's credentials.json in the working tree. Never commit that.
+.cache/

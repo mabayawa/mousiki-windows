@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 #ifdef _WIN32
@@ -11,6 +12,8 @@
 #include <windows.h>
 #else
 #include <cerrno>
+#include <csignal>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -122,10 +125,15 @@ HANDLE open_nul(DWORD access) {
 struct ChildProcess::Impl {
     HANDLE process = nullptr;
     HANDLE read_end = nullptr;
+    // Guards `process` only. read_stdout() deliberately does NOT take it --
+    // it blocks for as long as the child stays quiet, and a terminate() that
+    // had to wait on that lock could never unblock it.
+    std::mutex process_mutex;
 
     ~Impl() {
         if (read_end) CloseHandle(read_end);
-        if (process) CloseHandle(process);
+        std::lock_guard<std::mutex> lk(process_mutex);
+        if (process) { CloseHandle(process); process = nullptr; }
     }
 };
 
@@ -133,7 +141,8 @@ ChildProcess::ChildProcess() : impl_(new Impl) {}
 ChildProcess::~ChildProcess() = default;
 
 std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>& argv,
-                                                  bool merge_stderr) {
+                                                  bool merge_stderr,
+                                                  const std::string& stderr_path) {
     if (argv.empty()) return nullptr;
 
     std::string exe = win_find_executable(argv[0]);
@@ -167,7 +176,20 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
     SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
 
     HANDLE nul_in  = open_nul(GENERIC_READ);
-    HANDLE nul_err = merge_stderr ? nullptr : open_nul(GENERIC_WRITE);
+    // A real file when asked for, so a long-lived child's diagnostics survive;
+    // NUL otherwise, which is what every short-lived helper wants.
+    HANDLE log_err = nullptr;
+    if (!merge_stderr && !stderr_path.empty()) {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        std::wstring wpath = win_utf8_to_wide(stderr_path);
+        HANDLE h = CreateFileW(wpath.c_str(), FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) log_err = h;
+    }
+    HANDLE nul_err = (merge_stderr || log_err) ? nullptr : open_nul(GENERIC_WRITE);
 
     // Handle inheritance is a process-wide property, so a plain
     // bInheritHandles=TRUE lets a child started on one thread inherit the
@@ -181,6 +203,9 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
     inherit.push_back(write_end);
     if (nul_in)  inherit.push_back(nul_in);
     if (nul_err) inherit.push_back(nul_err);
+    // Must be listed too, or the child cannot write to it -- the handle list is
+    // exhaustive, not additive to some default.
+    if (log_err) inherit.push_back(log_err);
 
     // The sizing call is expected to fail with ERROR_INSUFFICIENT_BUFFER; its
     // job is only to fill in attr_size.
@@ -202,7 +227,7 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput  = nul_in;
     si.StartupInfo.hStdOutput = write_end;
-    si.StartupInfo.hStdError  = merge_stderr ? write_end : nul_err;
+    si.StartupInfo.hStdError  = merge_stderr ? write_end : (log_err ? log_err : nul_err);
     if (have_attrs) si.lpAttributeList = attrs;
 
     // CREATE_NO_WINDOW is the counterpart of the POSIX /dev/null stdin
@@ -226,6 +251,7 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
     CloseHandle(write_end);
     if (nul_in)  CloseHandle(nul_in);
     if (nul_err) CloseHandle(nul_err);
+    if (log_err) CloseHandle(log_err);
 
     if (!ok) {
         CloseHandle(read_end);
@@ -254,13 +280,39 @@ long long ChildProcess::read_stdout(void* buf, size_t count) {
     return static_cast<long long>(got);
 }
 
+long long ChildProcess::bytes_available() const {
+    if (!impl_->read_end) return -1;
+    DWORD avail = 0;
+    // Works on anonymous pipes, which is what spawn() creates.
+    if (!PeekNamedPipe(impl_->read_end, nullptr, 0, nullptr, &avail, nullptr)) return -1;
+    return static_cast<long long>(avail);
+}
+
 int ChildProcess::wait() {
     if (impl_->read_end) { CloseHandle(impl_->read_end); impl_->read_end = nullptr; }
-    if (!impl_->process) return -1;
-    WaitForSingleObject(impl_->process, INFINITE);
+    HANDLE h;
+    {
+        std::lock_guard<std::mutex> lk(impl_->process_mutex);
+        h = impl_->process;
+    }
+    if (!h) return -1;
+    // Waited on outside the lock: after a terminate() this returns at once,
+    // but on the normal path it blocks until the child exits, and holding the
+    // lock across that would make terminate() block too -- the deadlock this
+    // whole arrangement exists to avoid.
+    WaitForSingleObject(h, INFINITE);
     DWORD code = 0;
-    if (!GetExitCodeProcess(impl_->process, &code)) return -1;
+    if (!GetExitCodeProcess(h, &code)) return -1;
     return static_cast<int>(code);
+}
+
+void ChildProcess::terminate() {
+    std::lock_guard<std::mutex> lk(impl_->process_mutex);
+    if (!impl_->process) return;
+    // Deliberately NOT TerminateJobObject: every child mousiki spawns shares
+    // one job (see job_handle()), so that would take down every concurrent
+    // yt-dlp, ffprobe and lyrics helper along with this one.
+    TerminateProcess(impl_->process, 1);
 }
 
 // ===========================================================================
@@ -271,6 +323,8 @@ int ChildProcess::wait() {
 struct ChildProcess::Impl {
     pid_t pid = -1;
     int read_fd = -1;
+    // See the Windows Impl above for why read_stdout() must not take this.
+    std::mutex process_mutex;
 
     ~Impl() {
         if (read_fd >= 0) close(read_fd);
@@ -296,7 +350,8 @@ ChildProcess::~ChildProcess() = default;
 // argv directly, which is both one fewer process and the reason no argument
 // needs shell-quoting any more.
 std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>& argv,
-                                                  bool merge_stderr) {
+                                                  bool merge_stderr,
+                                                  const std::string& stderr_path) {
     if (argv.empty()) return nullptr;
 
     int out_pipe[2];
@@ -321,6 +376,9 @@ std::unique_ptr<ChildProcess> ChildProcess::spawn(const std::vector<std::string>
     posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
     if (merge_stderr) {
         posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDERR_FILENO);
+    } else if (!stderr_path.empty()) {
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, stderr_path.c_str(),
+                                        O_WRONLY | O_CREAT | O_APPEND, 0644);
     } else {
         posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     }
@@ -356,13 +414,38 @@ long long ChildProcess::read_stdout(void* buf, size_t count) {
     return static_cast<long long>(n);
 }
 
+long long ChildProcess::bytes_available() const {
+    if (impl_->read_fd < 0) return -1;
+    int n = 0;
+    if (::ioctl(impl_->read_fd, FIONREAD, &n) != 0) return -1;
+    return static_cast<long long>(n);
+}
+
 int ChildProcess::wait() {
     if (impl_->read_fd >= 0) { close(impl_->read_fd); impl_->read_fd = -1; }
-    if (impl_->pid < 0) return -1;
+    pid_t pid;
+    {
+        std::lock_guard<std::mutex> lk(impl_->process_mutex);
+        pid = impl_->pid;
+    }
+    if (pid < 0) return -1;
     int status = 0;
-    if (waitpid(impl_->pid, &status, 0) == impl_->pid && WIFEXITED(status))
+    // A killed child is WIFSIGNALED, not WIFEXITED, so this returns -1 for it.
+    // Callers that terminate() on purpose must check their own cancel flag
+    // rather than reading that as a decode failure.
+    if (waitpid(pid, &status, 0) == pid && WIFEXITED(status))
         return WEXITSTATUS(status);
     return -1;
+}
+
+void ChildProcess::terminate() {
+    std::lock_guard<std::mutex> lk(impl_->process_mutex);
+    if (impl_->pid < 0) return;
+    // SIGKILL rather than SIGTERM: the output of a cancelled decode is thrown
+    // away regardless, so there is nothing for a graceful shutdown to protect,
+    // and SIGKILL cannot be caught or ignored -- which is what guarantees the
+    // blocked reader actually unblocks.
+    ::kill(impl_->pid, SIGKILL);
 }
 
 #endif

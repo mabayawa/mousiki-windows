@@ -21,6 +21,8 @@ static Value track_to_json(const SnapshotTrack& t) {
     v.set("video_id", Value::make_str(t.video_id));
     v.set("title", Value::make_str(t.title));
     v.set("artist", Value::make_str(t.artist));
+    v.set("spotify_uri", Value::make_str(t.spotify_uri));
+    v.set("duration_sec", Value::make_num(t.duration_sec));
     return v;
 }
 
@@ -31,6 +33,10 @@ static SnapshotTrack track_from_json(const Value& v) {
     if (auto* p = v.find("video_id")) t.video_id = p->as_string();
     if (auto* p = v.find("title")) t.title = p->as_string();
     if (auto* p = v.find("artist")) t.artist = p->as_string();
+    // Absent in snapshots written before Spotify playback existed; a missing
+    // key simply leaves the default, so an old snapshot still loads.
+    if (auto* p = v.find("spotify_uri")) t.spotify_uri = p->as_string();
+    if (auto* p = v.find("duration_sec")) t.duration_sec = p->as_number(-1.0);
     return t;
 }
 

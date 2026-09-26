@@ -19,9 +19,11 @@
 #include "player.h"
 #include "settings.h"
 #include "snapshot.h"
+#include "librespot_session.h"
+#include "spotify_control.h"
 #include "spotify_source.h"
 #include "sphere_visualizer.h"
-#include "streaming_pcm.h"
+#include "decode_session.h"
 #include "terminal_ui.h"
 #include "waveform.h"
 #include "youtube_source.h"
@@ -38,6 +40,12 @@ struct QueueItem {
     std::string artist;
     fs::path local_path;   // valid if is_local
     std::string video_id;  // valid if !is_local
+    // Carried so a queued Spotify track stays a Spotify track. Without these,
+    // enqueuing one dropped its URI and its duration, and replaying it fell
+    // through to the YouTube search path with an empty artist -- a different
+    // recording, silently.
+    std::string spotify_uri;
+    double duration_sec = -1.0;
 };
 
 class App {
@@ -51,6 +59,8 @@ private:
     YoutubeSource youtube_{cache_};
     OnlineSource online_;
     SpotifySource spotify_;
+    SpotifyControl spotify_ctl_;
+    LibrespotSession librespot_;
     LocalSource local_source_;
     DiskArt disk_;
     mutable Player player_;
@@ -120,12 +130,13 @@ private:
     fs::path current_path_;
     bool current_is_local_ = true;  // for snapshot identity -- current_path_ alone is ambiguous
                                      // (online tracks resolve to a cache path too)
-    std::string current_video_id_;  // valid when !current_is_local_
+    std::string current_video_id_;
+    std::string current_spotify_uri_;  // valid when !current_is_local_
     TrackMetadata metadata_;
     std::vector<float> waveform_envelope_;
     std::chrono::steady_clock::time_point waveform_reveal_start_;
     bool waveform_ready_ = false;
-    std::shared_ptr<StreamingPcm> current_pcm_;
+    std::shared_ptr<DecodeSession> current_session_;
     size_t total_sec_ = 0;
     double angle_ = 0.0;
     std::chrono::steady_clock::time_point last_frame_time_;
@@ -306,9 +317,10 @@ private:
         bool success = false;
         std::string title, artist, location_label, error;
         fs::path path;
-        std::shared_ptr<StreamingPcm> pcm;
+        std::shared_ptr<DecodeSession> session;
         size_t total_sec = 0;
         TrackMetadata metadata;
+        std::string spotify_uri;
         bool is_local = true;   // for snapshot/resume identity -- which of path/video_id is authoritative
         std::string video_id;   // valid if !is_local
     };
@@ -334,7 +346,7 @@ private:
     // platforms. The generation counter still supersedes stale requests
     // exactly as it did before; only the thread's lifetime changed.
     struct DeviceRequest {
-        std::shared_ptr<StreamingPcm> pcm;
+        std::shared_ptr<PcmRing> pcm;
         double start_sec = 0.0;
         int volume = 70;
         int gen = 0;
@@ -353,17 +365,90 @@ private:
 
     PendingLoad pending_load_;
     void launch_load_async(fs::path local_path, std::string title, std::string artist,
-                            std::string location_label, bool is_local, std::string video_id);
+                            std::string location_label, bool is_local, std::string video_id,
+                            std::string spotify_uri = std::string());
     void poll_pending_load();
     static void write_load_timing_log(const std::string& title, bool is_local, double t_resolve,
                                        double t_probe, double t_total, const std::string& error);
 
-    // --- deferred mini-waveform pass ---
-    std::mutex waveform_mutex_;
-    std::atomic<bool> waveform_pending_ready_{false};
-    std::atomic<int> waveform_epoch_{0}; // incremented on each recompute; stale threads discard their result
-    std::vector<float> pending_waveform_envelope_;
+    // --- waveform envelope ---
+    // The mutex, the "pending envelope" handoff and the epoch counter that
+    // used to live here are gone: the envelope is no longer produced by a
+    // detached thread racing to publish a whole-track result, it is read
+    // straight off the DecodeSession's retained bins.
+    //
+    // True once the full-speed scan has been folded in, so the live
+    // (progressively filling) envelope stops overwriting the final one.
+    bool waveform_scan_applied_ = false;
+    int  waveform_live_tick_ = 0;
     void poll_pending_waveform();
+    void seek_to(double target_sec);
+    void seek_relative(double delta_sec);
+
+    // --- Spotify Connect ("remote") playback ---------------------------
+    // When the Spotify desktop app is open we drive IT over the Web API
+    // instead of decoding audio ourselves. That is the whole point -- no
+    // librespot needed -- but it also means mousiki never sees a single PCM
+    // sample, so the FFT, waveform and disk visualizers have nothing to draw.
+    // The UI has to say so, or they just look broken.
+    bool spotify_remote_ = false;
+    bool spotify_remote_paused_ = false;
+    std::string spotify_device_id_;
+    std::string spotify_device_name_;
+    std::vector<SpotifyDevice> spotify_devices_;
+    std::chrono::steady_clock::time_point spotify_devices_at_{};
+    std::chrono::steady_clock::time_point spotify_state_at_{};
+    // Position is polled about every 2 s and interpolated in between, so the
+    // progress bar moves smoothly instead of stepping once per poll.
+    double spotify_pos_base_ = 0.0;
+    std::chrono::steady_clock::time_point spotify_pos_at_{};
+
+    // A Spotify row was picked but the device list is not fresh yet, so the
+    // remote-vs-fallback decision has to wait one round trip.
+    OnlineResult pending_spotify_play_;
+    bool spotify_play_pending_ = false;
+
+    void poll_spotify();
+    void resolve_spotify_play(const OnlineResult& r);
+    void spotify_begin(const OnlineResult& r);
+    void spotify_fallback_to_youtube(const OnlineResult& r);
+
+    // --- Spotify audio through librespot, into our own ring ---------------
+    // The other half of B0: with no desktop app to drive, librespot decrypts
+    // the stream and we read raw PCM from its stdout. Unlike remote mode this
+    // DOES give us samples, so the visualizers work and the position is exact.
+    bool spotify_librespot_ = false;
+    std::string librespot_device_id_;
+    fs::path librespot_exe_;
+    bool librespot_checked_ = false;      // resolution attempted this session
+    bool librespot_unavailable_ = false;  // ... and there is no binary
+    OnlineResult pending_librespot_play_;
+    bool librespot_play_pending_ = false;
+    std::chrono::steady_clock::time_point librespot_wait_start_{};
+    bool librespot_said_auth_ = false;    // the one-time browser notice
+
+    fs::path resolve_librespot();
+    bool start_spotify_librespot(const OnlineResult& r);
+    bool launch_librespot_track(const OnlineResult& r, double start_sec);
+    void poll_librespot();
+    void stop_spotify_audio();
+
+    // --- gapless prefetch -------------------------------------------------
+    // The next track handed to Spotify before the current one ends, so the byte
+    // stream runs straight from one into the other.
+    OnlineResult prefetch_track_;
+    std::shared_ptr<DecodeSession> prefetch_session_;
+    bool prefetch_valid_ = false;
+    int  prefetch_boundary_ = 0;
+
+    bool peek_next_spotify(OnlineResult& out) const;
+    void maybe_prefetch_spotify();
+    bool adopt_prefetched_spotify();
+    bool start_spotify_remote(const OnlineResult& r);
+    std::string pick_spotify_device() const;
+    void launch_device_stop_async();
+    // Elapsed seconds for whichever transport is live.
+    double current_elapsed() const;
 
     // --- async online search ---
     std::thread search_thread_;

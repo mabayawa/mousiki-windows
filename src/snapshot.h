@@ -17,6 +17,8 @@ struct SnapshotTrack {
     std::string video_id;  // valid if !is_local
     std::string title;
     std::string artist;
+    std::string spotify_uri;    // valid if this came from Spotify
+    double duration_sec = -1.0; // -1 = unknown
 };
 
 // Deliberately does NOT include anything about appearance/colors --

@@ -396,6 +396,7 @@ App::App() {
     lyrics_script_ = find_script("fetch_lyrics.py");
     // Blank client id leaves spotify_.enabled() false and the feature inert.
     spotify_.configure(settings_.spotify_client_id, find_script("spotify.py"));
+    spotify_ctl_.configure(&spotify_);
     
     // Inject the cache directory into local music paths so streamed songs
     // automatically appear in the local view for seamless offline playback
@@ -646,7 +647,8 @@ void App::write_load_timing_log(const std::string& title, bool is_local, double 
 }
 
 void App::launch_load_async(fs::path local_path, std::string title, std::string artist,
-                             std::string location_label, bool is_local, std::string video_id) {
+                             std::string location_label, bool is_local, std::string video_id,
+                             std::string spotify_uri) {
     if (load_thread_.joinable()) load_thread_.join(); // previous job already signaled done, safe to reap
     load_in_progress_ = true;
     load_ready_ = false;
@@ -655,13 +657,14 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
     if (!is_local) status_line_ = "resolving \"" + title + "\" ...";
 
     // This thread ONLY resolves (online) and probes metadata/duration —
-    // both fast, no full decode. It publishes a result and returns. Full
-    // decode is a SEPARATE, detached thread spawned at the bottom, so
-    // this thread (the one the main loop's next launch_load_async call
-    // will join()) is never blocked waiting on decode — that's what
-    // makes it safe to join from launch_load_async without risking a
-    // freeze if the user switches tracks again quickly.
-    load_thread_ = std::thread([this, local_path, title, artist, location_label, is_local, video_id]() {
+    // both fast, no full decode. It publishes a result and returns. Decode
+    // runs on threads the DecodeSession owns, so this thread (the one the
+    // main loop's next launch_load_async call will join()) is never blocked
+    // waiting on it — that's what makes it safe to join from
+    // launch_load_async without risking a freeze if the user switches tracks
+    // again quickly.
+    load_thread_ = std::thread([this, local_path, title, artist, location_label, is_local, video_id,
+                                spotify_uri]() {
         using clock = std::chrono::steady_clock;
         auto t_start = clock::now();
         auto elapsed_s = [](clock::time_point from) {
@@ -674,6 +677,7 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
         pl.location_label = location_label;
         pl.is_local = is_local;
         pl.video_id = video_id;
+        pl.spotify_uri = spotify_uri;
 
         double t_resolve = 0.0, t_probe = 0.0;
 
@@ -727,8 +731,12 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
         t_probe = elapsed_s(t2);
         pl.total_sec = duration > 0 ? static_cast<size_t>(duration) : 0;
 
-        pl.pcm = std::make_shared<StreamingPcm>();
-        pl.pcm->reserve_for_seconds(duration > 0 ? duration : 300.0, 44100);
+        // No duration-sized allocation any more: the ring is a fixed 8 MiB
+        // regardless of track length, and a duration of 0 simply means the
+        // envelope adapts its bucket width instead of assuming 300 s and
+        // silently truncating anything longer, as the old path did.
+        pl.session = std::make_shared<DecodeSession>();
+        pl.session->start(path, 0.0, duration, /*want_scanner=*/true);
         pl.success = true;
 
         write_load_timing_log(pl.title, is_local, t_resolve, t_probe, elapsed_s(t_start), "");
@@ -739,38 +747,12 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
             load_ready_ = true;
         }
 
-        // Decode continues independently from here — detached because it
-        // may still be running when the user switches to a different
-        // track, and the StreamingPcm it's filling stays alive via the
-        // shared_ptr captured below (and via Player's own reference, if
-        // this track is still the one playing) for exactly as long as it
-        // needs to. Known tradeoff: if the app quits while a decode is
-        // still in flight, that ffmpeg subprocess can be orphaned rather
-        // than cleanly killed — worth fixing with real process-group
-        // tracking later, not a correctness or crash risk today.
-        std::shared_ptr<StreamingPcm> pcm = pl.pcm;
-        fs::path decode_path = path;
-        std::string wtitle = pl.title, wartist = pl.artist;
-        bool waveform_smooth = settings_.waveform_smooth; // captured by value — see below, avoids a cross-thread read of settings_
-        std::thread([this, decode_path, pcm, waveform_smooth]() {
-            stream_decode_ffmpeg(decode_path, *pcm);
-
-            // Deferred mini-waveform pass — only starts once decode is
-            // fully done, never gates playback.
-            if (!pcm->decode_failed.load()) {
-                // PERF: decode is done — pcm->data is no longer being
-                // written to, so we pass it directly as a const-ref
-                // instead of making a full snapshot copy.  A 5-minute
-                // track at 44100 Hz is ~50 MB; that copy was the single
-                // biggest reason the waveform appeared so late after
-                // playback started, because it doubled the working-set
-                // size and stalled the RMS pass behind a large memcpy.
-                auto envelope = WaveformQuantizer::generate_high_res_envelope(pcm->data, 4096, waveform_smooth);
-                std::lock_guard<std::mutex> lk(waveform_mutex_);
-                pending_waveform_envelope_ = std::move(envelope);
-                waveform_pending_ready_ = true;
-            }
-        }).detach();
+        // Decode is already running inside the DecodeSession started above,
+        // on threads it owns and can stop. What stood here was a DETACHED
+        // thread with no stop token, whose own comment conceded the cost:
+        // skipping a track left its ffmpeg running to completion, filling a
+        // buffer nobody would ever play, and quitting mid-decode orphaned the
+        // subprocess. Both are now handled by DecodeSession::shutdown().
     });
 }
 
@@ -793,6 +775,79 @@ void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path pa
         lyrics_result_ = std::move(r);
         lyrics_ready_ = true;
     }).detach();
+}
+
+// Absolute seek -- a primitive the app never had. Routes between a cursor
+// move inside what the ring still holds, and a producer restart at the target.
+void App::seek_to(double target_sec) {
+    if (!has_track_) return;
+    if (spotify_remote_) {
+        if (total_sec_ > 0) target_sec = std::clamp(target_sec, 0.0, static_cast<double>(total_sec_));
+        else                target_sec = std::max(0.0, target_sec);
+        // Move the local estimate immediately so the bar does not lag the
+        // keypress by a round trip.
+        spotify_pos_base_ = target_sec;
+        spotify_pos_at_ = std::chrono::steady_clock::now();
+        spotify_ctl_.seek(spotify_device_id_, static_cast<long long>(target_sec * 1000.0));
+        return;
+    }
+    if (!current_session_) return;
+    // Clamped against the real duration, not reserved capacity. The old
+    // seek_relative clamped to capacity_frames_ = duration * 1.25, so you
+    // could seek 25% past the end of a track into dead silence.
+    if (total_sec_ > 0) {
+        target_sec = std::clamp(target_sec, 0.0, static_cast<double>(total_sec_));
+    } else {
+        target_sec = std::max(0.0, target_sec);
+    }
+    // Near seeks are free on either transport: the ring retains ~11.9 s behind
+    // the cursor, so a -5 s tap is a cursor move and no stream is touched.
+    if (player_.try_seek_in_window(target_sec)) return;
+
+    if (spotify_librespot_) {
+        // Far seek. Nothing in the stream marks where a jump happened, so the
+        // bytes already in the pipe and the ring predate it and have to go.
+        // Pause first to bound how much more can arrive, ask the reader (the only
+        // thread that touches the pipe) to drain, then restart at the target with
+        // a fresh ring epoch at that absolute frame.
+        //
+        // Honest about the race: the Web API pause returns before librespot's
+        // player thread has necessarily stopped, so a fraction of a second of
+        // pre-seek audio can still land -- a blip at the seek point, which is the
+        // kind of artefact a seek is forgiven for. It cannot be eliminated
+        // without a delimited protocol.
+        player_.rebase_for_restart(target_sec);
+        librespot_.set_reader_paused(true);
+        spotify_ctl_.pause(librespot_device_id_);
+        librespot_.request_resync();
+
+        const long long origin = static_cast<long long>(target_sec * 44100.0);
+        current_session_->ring()->begin_epoch(origin);
+
+        LibrespotTrack t;
+        t.uri = current_spotify_uri_;
+        t.frames_expected =
+            total_sec_ > 0 ? static_cast<long long>(static_cast<double>(total_sec_) * 44100.0) : 0;
+        t.origin_frames = origin;
+        t.session = current_session_;
+        librespot_.reset_plan(std::move(t));
+        librespot_.set_reader_paused(false);
+        // play-with-position rather than a bare seek: it forces a sink stop/start,
+        // a cleaner boundary than a mid-stream jump. It also REPLACES the context,
+        // so any prefetch queued behind this track is gone and must be re-issued.
+        spotify_ctl_.play(librespot_device_id_, {current_spotify_uri_},
+                          static_cast<long long>(target_sec * 1000.0));
+        return;
+    }
+
+    // Order matters: rebase clears finished_ BEFORE the restart briefly empties
+    // the ring window, which would otherwise read as end-of-track and skip.
+    player_.rebase_for_restart(target_sec);
+    current_session_->request_seek(static_cast<int64_t>(target_sec * 44100.0));
+}
+
+void App::seek_relative(double delta_sec) {
+    seek_to(current_elapsed() + delta_sec);
 }
 
 void App::poll_pending_load() {
@@ -819,25 +874,38 @@ void App::poll_pending_load() {
     // first step, so no separate explicit stop() call is needed here —
     // and doing it inside play() (below, off the main thread) is what
     // lets this whole switch never touch the main thread.
-    current_pcm_ = pl.pcm;
+    // Cancels the previous track's producer, scanner and their ffmpeg
+    // children, and joins them. This is the skip-actually-stops-decoding
+    // fix; before, the old decode simply ran on unnoticed.
+    // A locally decoded track is starting, so neither Spotify transport is
+    // live any more. Note librespot mode ALSO goes through current_session_,
+    // so this must not clobber a librespot track's own session -- hence the
+    // guard in launch_librespot_track(), which assigns after this runs.
+    spotify_remote_ = false;
+    spotify_librespot_ = false;
+    prefetch_valid_ = false;
+    prefetch_session_.reset();
+    if (current_session_) current_session_->shutdown();
+    current_session_ = pl.session;
     total_sec_ = pl.total_sec;
     metadata_ = pl.metadata;
     current_path_ = pl.path;
     current_is_local_ = pl.is_local;
     current_video_id_ = pl.video_id;
+    current_spotify_uri_ = pl.spotify_uri;
     has_track_ = true;
     player_.clear_finished(); // see clear_finished()'s comment — closes the race that caused the double-skip bug
     waveform_envelope_.clear();
     waveform_ready_ = false;
-    waveform_pending_ready_ = false;
-    ++waveform_epoch_; // BUG FIX #5: invalidate any in-flight waveform from the previous track
+    waveform_scan_applied_ = false;
+    waveform_live_tick_ = 0;
     last_lyrics_status_.clear();
     fft_.reset(); // don't let the previous track's spectrum tail linger into this one's first frame
 
     launch_lyrics_fetch(pl.title, pl.artist, pl.path);
 
     // This is the whole point of the redesign: play() is handed a
-    // StreamingPcm that may have zero frames decoded yet. The audio
+    // PcmRing that may have zero frames decoded yet. The audio
     // callback plays silence for anything past what's been decoded and
     // self-corrects the instant more arrives — so sound starts the
     // moment decode produces its first chunk, not after the whole track.
@@ -897,7 +965,7 @@ void App::launch_device_play_async() {
     // for a noticeable time, and blocking here would freeze the render loop.
     start_device_worker();
     int my_gen = ++device_gen_;
-    auto pcm = current_pcm_;
+    auto pcm = current_session_ ? current_session_->ring() : nullptr;
     int vol = player_.volume() > 0 ? player_.volume() : 70;
     // One-shot resume position from a restored snapshot -- consumed
     // here exactly once, then zeroed so every subsequent track change
@@ -908,6 +976,12 @@ void App::launch_device_play_async() {
     // invariant obvious rather than implicit.
     double start_sec = resume_start_sec_;
     resume_start_sec_ = 0.0;
+    // The resume position now reaches the PRODUCER too, not just the
+    // Player. Previously a restored session at 2:30 started decoding at 0
+    // and played silence until it caught up.
+    if (start_sec > 0.0 && current_session_) {
+        current_session_->request_seek(static_cast<int64_t>(start_sec * 44100.0));
+    }
     {
         std::lock_guard<std::mutex> lk(device_mutex_);
         device_request_ = DeviceRequest{pcm, start_sec, vol, my_gen, true};
@@ -916,16 +990,23 @@ void App::launch_device_play_async() {
 }
 
 void App::poll_pending_waveform() {
-    if (!waveform_pending_ready_.load()) return;
-    std::vector<float> envelope;
-    {
-        std::lock_guard<std::mutex> lk(waveform_mutex_);
-        envelope = std::move(pending_waveform_envelope_);
-    }
-    waveform_pending_ready_ = false;
-    waveform_envelope_ = std::move(envelope);
+    if (!current_session_) return;
+    const bool scan = current_session_->scan_complete();
+    if (scan && waveform_scan_applied_) return;
+    // While only the live (playback-rate) envelope exists, refresh a few times
+    // a second rather than every frame -- it is a 48 KiB copy plus a 4096-bin
+    // pass, cheap but not free, and the panel cannot show more detail anyway.
+    if (!scan && (++waveform_live_tick_ % 12) != 0) return;
+
+    auto bins = current_session_->best_bins();
+    if (bins.empty()) return;
+    const bool first = !waveform_ready_;
+    waveform_envelope_ = WaveformQuantizer::envelope_from_bins(bins, settings_.waveform_smooth);
     waveform_ready_ = true;
-    waveform_reveal_start_ = std::chrono::steady_clock::now(); // starts the 700ms left-to-right reveal
+    if (scan) waveform_scan_applied_ = true;
+    // Only on the first reveal, so a live refresh does not restart the 700ms
+    // left-to-right animation on every tick.
+    if (first) waveform_reveal_start_ = std::chrono::steady_clock::now();
 }
 
 void App::launch_search_async(const std::string& query) {
@@ -1007,7 +1088,14 @@ int App::current_track_list_index() const {
     } else {
         if (current_is_local_) return -1; // playing a local track while browsing online results
         for (size_t i = 0; i < online_view_.size(); ++i) {
-            if (online_view_[i].video_id == current_video_id_) return static_cast<int>(i);
+            // Spotify rows all carry an empty video_id, so matching on that
+            // alone made every Spotify row match every other one.
+            if (!current_spotify_uri_.empty()) {
+                if (online_view_[i].spotify_uri == current_spotify_uri_) return static_cast<int>(i);
+            } else if (!current_video_id_.empty() &&
+                       online_view_[i].video_id == current_video_id_) {
+                return static_cast<int>(i);
+            }
         }
         return -1;
     }
@@ -1070,12 +1158,18 @@ void App::play_next_from_queue() {
         LocalTrack t{path_utf8(fs::path(item.local_path).stem()), item.local_path, item.artist};
         start_local_track(t);
     } else {
-        OnlineResult r{item.video_id, item.title, item.artist};
+        OnlineResult r{item.video_id, item.title, item.artist, item.duration_sec,
+                       item.spotify_uri};
         start_online_track(r);
     }
 }
 
 void App::advance_track() {
+    // Before anything else: librespot may already be streaming the next track
+    // into a buffer we prefetched, in which case the handover is a buffer swap
+    // rather than a fresh start.
+    if (adopt_prefetched_spotify()) return;
+
     has_track_ = false;
 
     // Repeat: keep replaying whatever just finished -- whether it came
@@ -1086,7 +1180,11 @@ void App::advance_track() {
     // once the queue was already empty, which was the other half of the
     // "queue mode won't respect repeat" bug.
     if (settings_.play_mode == 1 /*loop*/) {
-        launch_device_play_async(); // same track, already fully decoded, no reload needed
+        // The ring retains only ~23.8 s, so "already fully decoded, no
+        // reload needed" no longer holds. seek_to(0) restarts the producer
+        // at frame 0 without re-initialising the audio device, which makes
+        // the loop seamless rather than merely correct.
+        seek_to(0.0);
         has_track_ = true;
         player_.clear_finished();
         return;
@@ -1133,7 +1231,7 @@ void App::queue_add_selected() {
         queue_.push_back({true, t.title, t.folder_artist, t.path, ""});
     } else {
         const auto& r = online_view_[selected_];
-        queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
+        queue_.push_back({false, r.title, r.uploader, {}, r.video_id, r.spotify_uri, r.duration_sec});
     }
     clamp_queue_selected();
 }
@@ -1182,9 +1280,11 @@ SnapshotData App::build_snapshot() const {
         snap.now_playing.is_local = current_is_local_;
         snap.now_playing.path = current_is_local_ ? path_utf8(current_path_) : std::string();
         snap.now_playing.video_id = current_is_local_ ? std::string() : current_video_id_;
+        snap.now_playing.spotify_uri = current_is_local_ ? std::string() : current_spotify_uri_;
+        snap.now_playing.duration_sec = static_cast<double>(total_sec_);
         snap.now_playing.title = metadata_.name;
         snap.now_playing.artist = metadata_.artist;
-        snap.position_sec = player_.poll_elapsed();
+        snap.position_sec = current_elapsed();
     }
 
     for (const auto& item : queue_) {
@@ -1192,6 +1292,8 @@ SnapshotData App::build_snapshot() const {
         t.is_local = item.is_local;
         t.path = item.is_local ? path_utf8(item.local_path) : std::string();
         t.video_id = item.is_local ? std::string() : item.video_id;
+        t.spotify_uri = item.spotify_uri;
+        t.duration_sec = item.duration_sec;
         t.title = item.title;
         t.artist = item.artist;
         snap.queue.push_back(std::move(t));
@@ -1213,7 +1315,9 @@ void App::restore_snapshot(const SnapshotData& snap) {
 
     queue_.clear();
     for (const auto& t : snap.queue) {
-        queue_.push_back({t.is_local, t.title, t.artist, t.is_local ? fs::path(t.path) : fs::path(), t.video_id});
+        queue_.push_back({t.is_local, t.title, t.artist,
+                          t.is_local ? fs::path(t.path) : fs::path(), t.video_id,
+                          t.spotify_uri, t.duration_sec});
     }
     clamp_queue_selected();
 
@@ -1229,8 +1333,10 @@ void App::restore_snapshot(const SnapshotData& snap) {
             } else {
                 resume_start_sec_ = 0.0; // file's gone -- nothing to resume into
             }
-        } else if (!snap.now_playing.video_id.empty()) {
-            OnlineResult r{snap.now_playing.video_id, snap.now_playing.title, snap.now_playing.artist};
+        } else if (!snap.now_playing.video_id.empty() || !snap.now_playing.spotify_uri.empty()) {
+            OnlineResult r{snap.now_playing.video_id, snap.now_playing.title,
+                           snap.now_playing.artist, snap.now_playing.duration_sec,
+                           snap.now_playing.spotify_uri};
             start_online_track(r);
         } else {
             resume_start_sec_ = 0.0;
@@ -1333,7 +1439,8 @@ void App::commit_bulk_add(bool all) {
     for (size_t i = 0; i < pending_bulk_add_.items.size(); ++i) {
         if (!all && (i >= bulk_add_selected_.size() || !bulk_add_selected_[i])) continue;
         const auto& item = pending_bulk_add_.items[i];
-        queue_.push_back({false, item.title, item.uploader, {}, item.video_id});
+        queue_.push_back({false, item.title, item.uploader, {}, item.video_id,
+                          item.spotify_uri, item.duration_sec});
         ++added;
     }
     clamp_queue_selected();
@@ -1612,6 +1719,541 @@ void App::handle_settings_key(int key) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Spotify audio through librespot
+// ---------------------------------------------------------------------
+
+// Config override -> PATH -> our cache dir -> ask the helper to fetch one.
+// Cached for the session either way: re-probing on every track would mean a
+// Python subprocess per play just to be told the same thing again.
+fs::path App::resolve_librespot() {
+    if (librespot_checked_) return librespot_exe_;
+    librespot_checked_ = true;
+
+    const std::string configured = settings_.spotify_librespot_path;
+#ifdef _WIN32
+    // Handles both an explicit path and a bare name, walking %PATHEXT%.
+    std::string found = win_find_executable(configured.empty() ? "librespot" : configured);
+#else
+    std::string found;
+    if (!configured.empty()) {
+        std::error_code ec;
+        if (fs::exists(fs::path(configured), ec)) found = configured;
+    }
+#endif
+    if (!found.empty()) { librespot_exe_ = fs::path(found); return librespot_exe_; }
+
+    // The managed copy, which is where ensure-librespot puts one.
+    if (const char* home = std::getenv("HOME")) {
+        fs::path cached = fs::path(home) / ".cache" / "mousiki" / "bin";
+#ifdef _WIN32
+        cached /= "librespot.exe";
+#else
+        cached /= "librespot";
+#endif
+        std::error_code ec;
+        if (fs::exists(cached, ec)) { librespot_exe_ = cached; return librespot_exe_; }
+    }
+
+    // Last resort: let the helper try to fetch a pinned build. It refuses when
+    // no checksum is pinned, which is deliberate -- see spotify.py.
+    std::string err;
+    fs::path got = spotify_.ensure_librespot(&err);
+    if (!got.empty()) { librespot_exe_ = got; return librespot_exe_; }
+    librespot_unavailable_ = true;
+    if (!err.empty()) ConsoleLog::instance().log_basic(err);
+    return {};
+}
+
+// Tears down whichever Spotify transport is live, so two can never run at once.
+void App::stop_spotify_audio() {
+    if (spotify_remote_ && !spotify_device_id_.empty()) {
+        spotify_ctl_.pause(spotify_device_id_);
+    }
+    if (spotify_librespot_) {
+        librespot_.set_reader_paused(true);
+        if (!librespot_device_id_.empty()) spotify_ctl_.pause(librespot_device_id_);
+    }
+    spotify_remote_ = false;
+    spotify_librespot_ = false;
+}
+
+bool App::start_spotify_librespot(const OnlineResult& r) {
+    if (librespot_unavailable_) return false;
+    const fs::path exe = resolve_librespot();
+    if (exe.empty()) return false;
+
+    if (!librespot_.alive()) {
+        LibrespotSession::Config cfg;
+        cfg.exe = exe;
+        const char* home = std::getenv("HOME");
+        const fs::path base = home ? fs::path(home) : fs::path(".");
+        cfg.cache_dir = base / ".cache" / "mousiki" / "librespot";
+        cfg.log_path = base / ".cache" / "mousiki" / "logs" / "librespot.log";
+        cfg.device_name = "mousiki";
+        cfg.bitrate = 320;
+        std::string err;
+        if (!librespot_.start(cfg, &err)) {
+            librespot_unavailable_ = true;
+            log_event(err.empty() ? std::string("librespot: failed to start") : err);
+            return false;
+        }
+        log_event("librespot: starting ...");
+    }
+
+    // It must authenticate and register with Spotify before the Web API can see
+    // it -- a couple of seconds, or a browser round trip the very first time.
+    const std::string self = librespot_.device_name();
+    for (const auto& d : spotify_devices_) {
+        if (d.name == self) {
+            librespot_device_id_ = d.id;
+            return launch_librespot_track(r, 0.0);
+        }
+    }
+    pending_librespot_play_ = r;
+    librespot_play_pending_ = true;
+    librespot_wait_start_ = std::chrono::steady_clock::now();
+    spotify_ctl_.request_devices();
+    status_line_ = "librespot: waiting for the device to register ...";
+    return true;   // deferred, not failed
+}
+
+bool App::launch_librespot_track(const OnlineResult& r, double start_sec) {
+    if (librespot_device_id_.empty()) return false;
+
+    // Whatever was playing stops first, local or remote.
+    if (current_session_) { current_session_->shutdown(); current_session_.reset(); }
+    stop_spotify_audio();
+
+    const double dur = r.duration_sec > 0 ? r.duration_sec : 0.0;
+    auto session = std::make_shared<DecodeSession>();
+    // External: samples arrive from librespot's stdout, which cannot be decoded
+    // a second time -- so no producer thread, and no full-speed waveform
+    // scanner. The envelope fills at playback speed instead.
+    session->start_external(dur);
+    const long long origin = static_cast<long long>(std::max(0.0, start_sec) * 44100.0);
+    if (origin > 0) session->ring()->begin_epoch(origin);
+
+    LibrespotTrack t;
+    t.uri = r.spotify_uri;
+    t.frames_expected = dur > 0 ? static_cast<long long>(dur * 44100.0) : 0;
+    t.origin_frames = origin;
+    t.session = session;
+    librespot_.reset_plan(std::move(t));
+    librespot_.set_reader_paused(false);
+
+    current_session_ = session;
+    spotify_librespot_ = true;
+    has_track_ = true;
+    current_is_local_ = false;
+    current_video_id_.clear();
+    current_spotify_uri_ = r.spotify_uri;
+    current_path_.clear();
+    total_sec_ = dur > 0 ? static_cast<size_t>(dur) : 0;
+    metadata_ = TrackMetadata{};
+    metadata_.name = r.title;
+    metadata_.artist = r.uploader;
+    metadata_.location = "spotify";
+    waveform_envelope_.clear();
+    waveform_ready_ = false;
+    waveform_scan_applied_ = false;
+    waveform_live_tick_ = 0;
+    fft_.reset();
+    player_.clear_finished();
+
+    // Tell Spotify to play it on OUR device. One uri here; the prefetch appends
+    // the next one to Spotify's queue later, which is what makes it gapless.
+    spotify_ctl_.play(librespot_device_id_, {r.spotify_uri},
+                      start_sec > 0.0 ? static_cast<long long>(start_sec * 1000.0) : -1);
+    resume_start_sec_ = start_sec;
+    launch_device_play_async();
+    launch_lyrics_fetch(r.title, r.uploader, {});
+    return true;
+}
+
+void App::poll_librespot() {
+    if (!librespot_play_pending_) {
+        // Notice a dead daemon even while idle, so the next play does not
+        // silently do nothing.
+        if (spotify_librespot_ && librespot_.state() == LibrespotSession::State::Dead) {
+            const std::string e = librespot_.last_error();
+            log_event(e.empty() ? std::string("librespot: stopped unexpectedly") : e);
+            librespot_.shutdown();
+            spotify_librespot_ = false;
+        }
+        return;
+    }
+
+    const std::string self = librespot_.device_name();
+    for (const auto& d : spotify_devices_) {
+        if (d.name == self) {
+            librespot_play_pending_ = false;
+            librespot_device_id_ = d.id;
+            const OnlineResult r = pending_librespot_play_;
+            if (!launch_librespot_track(r, 0.0)) spotify_fallback_to_youtube(r);
+            return;
+        }
+    }
+
+    if (librespot_.state() == LibrespotSession::State::Dead ||
+        librespot_.state() == LibrespotSession::State::Failed) {
+        librespot_play_pending_ = false;
+        const std::string e = librespot_.last_error();
+        log_event(e.empty() ? std::string("librespot: failed to start") : e);
+        librespot_unavailable_ = true;
+        spotify_fallback_to_youtube(pending_librespot_play_);
+        return;
+    }
+
+    const double waited = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - librespot_wait_start_).count();
+
+    // The first run waits on a human approving a browser prompt, so this is
+    // generous on purpose -- and says why, because an unexplained wait here
+    // looks exactly like a hang.
+    if (!librespot_said_auth_ && waited > 6.0) {
+        librespot_said_auth_ = true;
+        log_event("librespot: approve the mousiki player in your browser. This is a one-time "
+                  "sign-in for the playback engine, separate from the Spotify login mousiki "
+                  "already has.");
+        // Logged because librespot's automatic browser open can fail silently,
+        // and then this is the only route to the prompt.
+        const std::string url = librespot_.auth_url();
+        if (!url.empty()) ConsoleLog::instance().log_basic("librespot: sign-in URL: " + url);
+    }
+    if (waited > 180.0) {
+        librespot_play_pending_ = false;
+        log_event("librespot: gave up waiting for the device -- playing via YouTube instead");
+        spotify_fallback_to_youtube(pending_librespot_play_);
+        return;
+    }
+    // request_devices() coalesces, so this cannot pile up.
+    spotify_ctl_.request_devices();
+}
+
+// What would play after the current track, without committing to it.
+//
+// Gapless forces this decision EARLIER than advance_track() has ever had to make
+// it -- the next track has to be handed to Spotify while the current one is
+// still playing. The choice is re-validated at the boundary, because the user
+// can reorder the queue in between.
+bool App::peek_next_spotify(OnlineResult& out) const {
+    if (!queue_.empty()) {
+        const QueueItem& q = queue_.front();
+        if (q.is_local || q.spotify_uri.empty()) return false;
+        out = OnlineResult{q.video_id, q.title, q.artist, q.duration_sec, q.spotify_uri};
+        return true;
+    }
+    // Shuffle would need its random draw made here and remembered, or the
+    // prefetched track and the chosen one disagree by construction. Not worth
+    // it for a first cut: skip the prefetch and take the small gap.
+    if (settings_.play_mode == 2 /*shuffle*/) return false;
+    if (settings_.play_mode == 3 /*stop*/) return false;
+    if (settings_.play_mode == 1 /*loop*/) {
+        // Repeat-one IS gaplessly expressible: queue the same uri again.
+        if (current_spotify_uri_.empty()) return false;
+        out = OnlineResult{"", metadata_.name, metadata_.artist,
+                           static_cast<double>(total_sec_), current_spotify_uri_};
+        return true;
+    }
+    if (list_source_ != ListSource::Online) return false;
+    const int idx = current_track_list_index();
+    if (idx < 0 || idx + 1 >= static_cast<int>(online_view_.size())) return false;
+    const OnlineResult& next = online_view_[idx + 1];
+    if (next.spotify_uri.empty()) return false;
+    out = next;
+    return true;
+}
+
+// Hands Spotify the next track while the current one is still playing, so
+// librespot rolls straight into it and the byte stream simply continues.
+//
+// POST /me/player/queue is the right primitive precisely because it does NOT
+// disturb what is playing; a PUT /play with a uris list would restart the track,
+// which is why that form is only usable at the very start.
+void App::maybe_prefetch_spotify() {
+    if (!spotify_librespot_ || prefetch_valid_) return;
+    if (!settings_.spotify_prefetch) return;
+    if (total_sec_ == 0 || librespot_device_id_.empty()) return;
+    // Far enough ahead that the request and Spotify's own buffering land before
+    // the boundary, close enough that the queue is unlikely to change first.
+    if (current_elapsed() < static_cast<double>(total_sec_) - 20.0) return;
+
+    OnlineResult next;
+    if (!peek_next_spotify(next)) return;
+
+    auto session = std::make_shared<DecodeSession>();
+    const double dur = next.duration_sec > 0 ? next.duration_sec : 0.0;
+    session->start_external(dur);
+
+    LibrespotTrack t;
+    t.uri = next.spotify_uri;
+    t.frames_expected = dur > 0 ? static_cast<long long>(dur * 44100.0) : 0;
+    t.session = session;
+    librespot_.append_plan(std::move(t));
+    spotify_ctl_.enqueue(librespot_device_id_, next.spotify_uri);
+
+    prefetch_track_ = next;
+    prefetch_session_ = session;
+    prefetch_valid_ = true;
+    prefetch_boundary_ = librespot_.boundary_seq();
+    ConsoleLog::instance().log_verbose("spotify: prefetched \"" + next.title + "\" for a gapless handover");
+}
+
+// Called at the top of advance_track(). If librespot has already crossed into
+// the prefetched track, take it over rather than starting anything.
+bool App::adopt_prefetched_spotify() {
+    if (!spotify_librespot_ || !prefetch_valid_ || !prefetch_session_) return false;
+    // The reader only bumps this once it has actually begun filling the next
+    // ring, so this is the signal that the handover really happened.
+    if (librespot_.boundary_seq() == prefetch_boundary_) return false;
+
+    // Re-validate: the user may have reordered the queue since the prefetch.
+    OnlineResult want;
+    const bool still = peek_next_spotify(want) && want.spotify_uri == prefetch_track_.spotify_uri;
+    if (!still) {
+        // Correct beats seamless. Drop the prefetch and let the normal path run,
+        // which costs a short gap.
+        prefetch_valid_ = false;
+        prefetch_session_.reset();
+        return false;
+    }
+
+    const OnlineResult r = prefetch_track_;
+    if (!queue_.empty() && queue_.front().spotify_uri == r.spotify_uri) {
+        queue_.erase(queue_.begin());
+        clamp_queue_selected();
+    }
+
+    current_session_ = prefetch_session_;
+    prefetch_valid_ = false;
+    prefetch_session_.reset();
+
+    current_spotify_uri_ = r.spotify_uri;
+    total_sec_ = r.duration_sec > 0 ? static_cast<size_t>(r.duration_sec) : 0;
+    metadata_ = TrackMetadata{};
+    metadata_.name = r.title;
+    metadata_.artist = r.uploader;
+    metadata_.location = "spotify";
+    waveform_envelope_.clear();
+    waveform_ready_ = false;
+    waveform_scan_applied_ = false;
+    waveform_live_tick_ = 0;
+    fft_.reset();
+
+    // The whole point: swap the buffer under a RUNNING device. Going through
+    // launch_device_play_async() would re-init it and put a hole in the audio
+    // exactly where gapless is supposed to have none.
+    player_.adopt_ring(current_session_->ring(), 0.0);
+    player_.clear_finished();
+    has_track_ = true;
+    launch_lyrics_fetch(r.title, r.uploader, {});
+    log_event("spotify: " + r.title);
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Spotify Connect ("remote") playback
+// ---------------------------------------------------------------------
+
+// Which Connect endpoint to drive. Per the chosen design: if the Spotify
+// desktop app is open, it wins -- librespot only ever covers the case where
+// Spotify is not running at all.
+std::string App::pick_spotify_device() const {
+    const std::string self = "mousiki";   // librespot registers under this name
+    // An already-active device first: taking playback off whatever the user is
+    // actively listening on would be rude, but it is also exactly where they
+    // expect a track they just picked to start.
+    for (const auto& d : spotify_devices_) {
+        if (d.active && d.name != self) return d.id;
+    }
+    for (const auto& d : spotify_devices_) {
+        if (d.type == "Computer" && d.name != self) return d.id;
+    }
+    for (const auto& d : spotify_devices_) {
+        if (d.name != self) return d.id;
+    }
+    return std::string();
+}
+
+// Stops the audio device without decoding anything, by posting a request with
+// no buffer: Player::play() calls stop() as its first step and then bails on a
+// null ring. Going through the device worker matters -- the device must be
+// torn down on the thread that created it (see the COM note in app.h).
+void App::launch_device_stop_async() {
+    start_device_worker();
+    int my_gen = ++device_gen_;
+    {
+        std::lock_guard<std::mutex> lk(device_mutex_);
+        device_request_ = DeviceRequest{nullptr, 0.0, player_.volume(), my_gen, true};
+    }
+    device_cv_.notify_one();
+}
+
+bool App::start_spotify_remote(const OnlineResult& r) {
+    const std::string dev = pick_spotify_device();
+    if (dev.empty()) return false;
+
+    // Nothing local is playing any more: stop the device and cancel any decode
+    // still running, or a previous track would keep going underneath Spotify.
+    if (current_session_) { current_session_->shutdown(); current_session_.reset(); }
+    launch_device_stop_async();
+
+    spotify_remote_ = true;
+    spotify_remote_paused_ = false;
+    spotify_device_id_ = dev;
+    spotify_device_name_.clear();
+    for (const auto& d : spotify_devices_) {
+        if (d.id == dev) { spotify_device_name_ = d.name; break; }
+    }
+
+    has_track_ = true;
+    current_is_local_ = false;
+    current_video_id_.clear();
+    current_spotify_uri_ = r.spotify_uri;
+    current_path_.clear();
+    total_sec_ = r.duration_sec > 0 ? static_cast<size_t>(r.duration_sec) : 0;
+    metadata_ = TrackMetadata{};
+    metadata_.name = r.title;
+    metadata_.artist = r.uploader;
+    metadata_.location = "spotify";
+
+    spotify_pos_base_ = 0.0;
+    spotify_pos_at_ = std::chrono::steady_clock::now();
+    spotify_state_at_ = spotify_pos_at_;
+
+    // No PCM ever reaches us in this mode, so nothing can drive these.
+    waveform_envelope_.clear();
+    waveform_ready_ = false;
+    waveform_scan_applied_ = false;
+    fft_.reset();
+    player_.clear_finished();
+
+    spotify_ctl_.play(dev, {r.spotify_uri});
+    launch_lyrics_fetch(r.title, r.uploader, {});
+    log_event("spotify: playing via " +
+              (spotify_device_name_.empty() ? std::string("Spotify") : spotify_device_name_) +
+              " -- visualizers unavailable in this mode");
+    return true;
+}
+
+double App::current_elapsed() const {
+    if (spotify_remote_) {
+        if (spotify_remote_paused_) return spotify_pos_base_;
+        const double since =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - spotify_pos_at_).count();
+        double pos = spotify_pos_base_ + since;
+        if (total_sec_ > 0) pos = std::min(pos, static_cast<double>(total_sec_));
+        return std::max(0.0, pos);
+    }
+    return player_.poll_elapsed();
+}
+
+void App::poll_spotify() {
+    // Drain whatever the worker finished, whether or not we are in remote mode
+    // -- a device list request may still be in flight from a play attempt.
+    std::vector<SpotifyDevice> devs;
+    if (spotify_ctl_.take_devices(devs)) {
+        spotify_devices_ = std::move(devs);
+        spotify_devices_at_ = std::chrono::steady_clock::now();
+    }
+    if (std::string e = spotify_ctl_.take_error(); !e.empty()) {
+        log_event(e);
+    }
+
+    if (spotify_play_pending_ && spotify_devices_at_.time_since_epoch().count() != 0) {
+        spotify_play_pending_ = false;
+        spotify_begin(pending_spotify_play_);
+        return;
+    }
+
+    maybe_prefetch_spotify();
+
+    if (!spotify_remote_) return;
+
+    SpotifyPlaybackState st;
+    if (spotify_ctl_.take_state(st)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (st.duration_ms > 0) total_sec_ = static_cast<size_t>(st.duration_ms / 1000);
+
+        // The user moved playback to another device (their phone, say). Yield
+        // rather than fight over it -- an account plays on one device at a time.
+        if (!st.device_id.empty() && st.device_id != spotify_device_id_) {
+            log_event("spotify: playback moved to " +
+                      (st.device_name.empty() ? std::string("another device") : st.device_name));
+            spotify_device_id_ = st.device_id;
+            spotify_device_name_ = st.device_name;
+        }
+
+        // Track ended. With a single-uri play and repeat off, Spotify simply
+        // stops, so "not playing AND we were near the end" is the signal. A
+        // stall near the start is a buffering hiccup, not an ending.
+        const bool near_end = st.duration_ms > 0 && st.progress_ms >= st.duration_ms - 2000;
+        const bool changed = !st.uri.empty() && !current_spotify_uri_.empty() &&
+                             st.uri != current_spotify_uri_;
+        if ((!st.playing && near_end) || changed) {
+            advance_track();
+            return;
+        }
+
+        spotify_remote_paused_ = !st.playing;
+        spotify_pos_base_ = static_cast<double>(st.progress_ms) / 1000.0;
+        spotify_pos_at_ = now;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - spotify_state_at_).count() >= 2000) {
+        spotify_state_at_ = now;
+        spotify_ctl_.request_state();
+    }
+
+    // Belt and braces: if interpolation has run past the end and the poll has
+    // not caught up yet, advance anyway rather than sit on a finished track.
+    if (!spotify_remote_paused_ && total_sec_ > 0 &&
+        current_elapsed() >= static_cast<double>(total_sec_)) {
+        advance_track();
+    }
+}
+
+// Decide between driving a Connect device and falling back to YouTube. The
+// device list is fetched asynchronously, so when it is stale this defers the
+// choice by one round trip rather than guessing wrong.
+void App::resolve_spotify_play(const OnlineResult& r) {
+    if (!spotify_.enabled()) { spotify_fallback_to_youtube(r); return; }
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool fresh =
+        spotify_devices_at_.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::seconds>(now - spotify_devices_at_).count() < 10;
+
+    if (fresh) { spotify_begin(r); return; }
+    pending_spotify_play_ = r;
+    spotify_play_pending_ = true;
+    spotify_ctl_.request_devices();
+    status_line_ = "spotify: looking for a device ...";
+}
+
+// The order is the design decision from B0: an open Spotify desktop app wins,
+// because that is what the user asked for. librespot is what covers the case
+// where Spotify is not running -- and it is the only mode that gives us PCM, so
+// it is also the only one where the visualizers work.
+void App::spotify_begin(const OnlineResult& r) {
+    if (start_spotify_remote(r)) return;
+    if (start_spotify_librespot(r)) return;
+    log_event("spotify: no Connect device and no librespot -- playing via YouTube instead");
+    spotify_fallback_to_youtube(r);
+}
+
+// Neither Spotify transport is available. The honest fallback is the behaviour
+// that already existed: find the same song on YouTube. The Spotify
+// title and artist make a far better query than a raw video title, and the
+// lyrics lookup benefits from the real artist field too.
+void App::spotify_fallback_to_youtube(const OnlineResult& r) {
+    spotify_remote_ = false;
+    launch_load_async({}, r.title, r.uploader, "spotify",
+                      /*is_local=*/false, /*video_id=*/"", r.spotify_uri);
+}
+
 void App::start_local_track(const LocalTrack& track) {
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
     fs::path parent = track.path.parent_path().filename();
@@ -1623,12 +2265,7 @@ void App::start_online_track(const OnlineResult& result) {
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
 
     if (!result.spotify_uri.empty()) {
-        // Spotify gives a clean title and a real artist field, unlike a
-        // YouTube video title, so both are worth passing on: the YouTube
-        // search below uses them to find the audio, and the lyrics lookup
-        // gets a far better query than it would from a raw video title.
-        launch_load_async({}, result.title, result.uploader, "spotify",
-                          /*is_local=*/false, /*video_id=*/"");
+        resolve_spotify_play(result);
         return;
     }
 
@@ -1817,7 +2454,7 @@ void App::handle_key(int key) {
             }
             break;
         case 'C': // right = seek forward
-            if (has_track_) player_.seek_relative(5.0);
+            if (has_track_) seek_relative(5.0);
             break;
         case 'D': // left = seek back ... OR, while queue-focused, move the hovering queue item down.
             // Left-arrow and Shift+D are indistinguishable at the terminal-
@@ -1827,13 +2464,47 @@ void App::handle_key(int key) {
             // trade since you're not usually seeking while reordering a
             // queue anyway.
             if (queue_focus_) queue_move_hovering(1);
-            else if (has_track_) player_.seek_relative(-5.0);
+            else if (has_track_) seek_relative(-5.0);
             break;
         case 'u': case 'U': // move the hovering queue item up (only meaningful once you've Tab'd into the queue)
             queue_move_hovering(-1);
             break;
         case 'p': case 'P': // play/pause
-            if (has_track_) { if (player_.is_paused()) player_.resume(); else player_.pause(); }
+            if (!has_track_) break;
+            if (spotify_remote_) {
+                // Flip the local flag first so the progress bar responds at
+                // once; the Web API round trip takes a few hundred ms and the
+                // next state poll confirms or corrects it.
+                if (spotify_remote_paused_) {
+                    spotify_pos_at_ = std::chrono::steady_clock::now();
+                    spotify_remote_paused_ = false;
+                    spotify_ctl_.resume(spotify_device_id_);
+                } else {
+                    spotify_pos_base_ = current_elapsed();
+                    spotify_remote_paused_ = true;
+                    spotify_ctl_.pause(spotify_device_id_);
+                }
+            } else if (spotify_librespot_) {
+                // The local pause alone WOULD stop the audio -- the cursor stops,
+                // the ring fills, and librespot blocks on a full pipe. But
+                // Spotify would go on believing the track is playing and keep
+                // advancing its own position, so the session has to be paused
+                // server-side too. Resuming is instant either way, because the
+                // ring still holds several seconds of decoded audio.
+                if (player_.is_paused()) {
+                    player_.resume();
+                    librespot_.set_reader_paused(false);
+                    spotify_ctl_.resume(librespot_device_id_);
+                } else {
+                    player_.pause();
+                    librespot_.set_reader_paused(true);
+                    spotify_ctl_.pause(librespot_device_id_);
+                }
+            } else if (player_.is_paused()) {
+                player_.resume();
+            } else {
+                player_.pause();
+            }
             break;
         case '1': // volume up
             if (has_track_) player_.set_volume(std::min(100, player_.volume() + 5));
@@ -2073,23 +2744,15 @@ void App::ensure_visible_row_meta() {
 // far (streaming decode may still be filling it in, hence the acquire
 // load of `available` rather than assuming it's complete).
 void App::recompute_waveform_for_current_track() {
-    if (!has_track_ || !current_pcm_) return;
-    std::shared_ptr<StreamingPcm> pcm = current_pcm_;
-    bool smooth = settings_.waveform_smooth;
-    // BUG FIX #5: increment epoch before spawning — any already-running
-    // waveform thread will see its own epoch is stale and discard its
-    // result instead of racing to overwrite pending_waveform_envelope_.
-    int my_epoch = ++waveform_epoch_;
-    std::thread([this, pcm, smooth, my_epoch]() {
-        size_t n = pcm->available.load(std::memory_order_acquire);
-        if (n == 0) return;
-        std::vector<float> snapshot(pcm->data.begin(), pcm->data.begin() + static_cast<long>(n));
-        auto envelope = WaveformQuantizer::generate_high_res_envelope(snapshot, 4096, smooth);
-        std::lock_guard<std::mutex> lk(waveform_mutex_);
-        if (my_epoch != waveform_epoch_.load()) return; // superseded — discard
-        pending_waveform_envelope_ = std::move(envelope);
-        waveform_pending_ready_ = true;
-    }).detach();
+    if (!has_track_ || !current_session_) return;
+    // Was a detached thread re-running the RMS pass over the whole decoded
+    // track, guarded by an epoch counter against stale results. None of that
+    // is needed now: the raw bins are retained, so this is a 4096-bin pass
+    // costing tens of microseconds -- cheap enough to just do here.
+    auto bins = current_session_->best_bins();
+    if (bins.empty()) return;
+    waveform_envelope_ = WaveformQuantizer::envelope_from_bins(bins, settings_.waveform_smooth);
+    waveform_ready_ = true;
 }
 
 void App::launch_row_meta_resolver() {
@@ -2152,7 +2815,7 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
         }
     }
 
-    double elapsed = has_track_ ? player_.poll_elapsed() : 0.0;
+    double elapsed = has_track_ ? current_elapsed() : 0.0;
     fft_.set_fluidity(settings_.visualizer_fluidity);
     fft_.set_degradation_speed(settings_.visualizer_degradation_speed);
     fft_.set_viscosity(settings_.visualizer_viscosity);
@@ -2391,7 +3054,7 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     int main_total_w = std::max(24, total_width - side_panel_w);
     int wave_w = main_total_w - 4;
 
-    double elapsed = has_track_ ? player_.poll_elapsed() : 0.0;
+    double elapsed = has_track_ ? current_elapsed() : 0.0;
     int active_cols = (total_sec_ > 0) ? static_cast<int>((elapsed / static_cast<double>(total_sec_)) * wave_w) : 0;
     active_cols = std::clamp(active_cols, 0, wave_w);
 
@@ -2460,7 +3123,9 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
         std::string bar = border_ansi + settings_.box_vertical + "\x1b[0m";
         return bar + " " + centered + " " + bar;
     };
-    std::string play_label = (has_track_ && player_.is_paused()) ? "PLAY" : (has_track_ ? "PAUSE" : "PLAY");
+    const bool showing_paused = has_track_ && (spotify_remote_ ? spotify_remote_paused_
+                                                              : player_.is_paused());
+    std::string play_label = showing_paused ? "PLAY" : (has_track_ ? "PAUSE" : "PLAY");
 
     std::vector<std::string> out;
     if (settings_.element_dummy_buttons) {
@@ -3624,13 +4289,16 @@ int App::run() {
         last_frame_time_ = now;
         viz_dt_ = dt;
 
-        if (has_track_) {
+        poll_spotify();
+        poll_librespot();
+
+        if (has_track_ && !spotify_remote_) {
             player_.poll_elapsed();
             if (player_.finished()) advance_track();
         }
         // Disk only spins while something is actually playing — frozen
         // when idle or paused, per instruction.
-        if (has_track_ && !player_.is_paused()) {
+        if (has_track_ && !(spotify_remote_ ? spotify_remote_paused_ : player_.is_paused())) {
             angle_ = std::fmod(angle_ + kAngularVelocity * settings_.disk_rotation_speed * dt,
                                2.0 * 3.14159265358979323846);
         }
@@ -3650,6 +4318,10 @@ int App::run() {
     // player_.stop() itself, so the device is destroyed on the thread that
     // created it.
     stop_device_worker();
+    librespot_.shutdown();
+    spotify_ctl_.stop();
+    // After the device is down, so nothing is still reading the ring.
+    if (current_session_) current_session_->shutdown();
     term.restore();
     save_settings(settings_);
     // Final snapshot on a clean quit -- same single-canonical-file

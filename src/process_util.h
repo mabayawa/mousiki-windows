@@ -37,15 +37,47 @@ public:
     ChildProcess& operator=(const ChildProcess&) = delete;
 
     // Returns nullptr if the process could not be started.
+    //
+    // `stderr_path`, when given, appends the child's stderr to that file. That
+    // matters for a long-lived child whose diagnostics you actually need:
+    // librespot logs to stderr, and merge_stderr would splice those log lines
+    // straight into the raw PCM on stdout -- audible as clicks, and fatal to
+    // counting frames. The alternative was stderr to NUL, i.e. no way at all to
+    // see why an authentication attempt failed.
     static std::unique_ptr<ChildProcess> spawn(const std::vector<std::string>& argv,
-                                               bool merge_stderr = false);
+                                               bool merge_stderr = false,
+                                               const std::string& stderr_path = std::string());
 
     // Blocking read from the child's stdout. Returns the byte count, 0 at
     // end of stream, or -1 on error.
     long long read_stdout(void* buf, size_t count);
 
+    // Bytes readable from stdout right now, without blocking. -1 on error.
+    //
+    // read_stdout() blocks, which is correct for a decoder that will always
+    // produce more, but wrong when discarding a backlog: a paused Spotify writes
+    // nothing at all, so a blocking drain would simply never return. This lets a
+    // drain loop stop as soon as the stream goes quiet.
+    long long bytes_available() const;
+
     // Closes the pipe and reaps the child. Returns its exit code, or -1.
     int wait();
+
+    // Kills the child immediately. Safe to call from another thread while
+    // this thread is blocked inside read_stdout().
+    //
+    // That cross-thread safety is the entire point: without it there is no
+    // way to abandon a decode. Killing the child closes ITS end of the pipe,
+    // which makes a blocked ReadFile/read() return end-of-stream, so the
+    // reader unblocks on its own and the normal `read_stdout() == 0 -> wait()`
+    // teardown runs unchanged. Nothing here closes a handle -- only the owning
+    // thread does that, in wait() or the destructor -- so a reader can never
+    // find the handle yanked out from under it mid-call.
+    //
+    // A terminated child always reports a non-zero exit status, so callers
+    // that kill on purpose must check their own cancel flag before treating
+    // that as a decode failure.
+    void terminate();
 
 private:
     ChildProcess();

@@ -23,6 +23,7 @@ import http.server
 import json
 import os
 import pathlib
+import platform
 import secrets
 import sys
 import threading
@@ -58,10 +59,20 @@ REDIRECT_URI = "http://127.0.0.1:%d/callback" % REDIRECT_PORT
 # user-*-playback : see and control what is playing, i.e. point librespot at a
 #                   track once it has registered itself as a Connect device
 # streaming       : required for Connect playback control
+# user-read-private : the ONLY source of "product" (premium/free) and
+#                     "country" on /me. Without it Spotify omits both fields
+#                     entirely and cmd_status reports product=null, so the
+#                     Premium check cannot tell a Free account from a Premium
+#                     one. Tokens minted before this scope existed still work
+#                     for everything else -- they just report product=null, and
+#                     callers must treat that as "unknown", not as "not
+#                     premium", or an existing login would be locked out of
+#                     playback until the user happens to re-authorise.
 SCOPES = " ".join([
     "playlist-read-private",
     "playlist-read-collaborative",
     "user-library-read",
+    "user-read-private",
     "user-read-playback-state",
     "user-modify-playback-state",
     "streaming",
@@ -391,29 +402,247 @@ def cmd_devices(client_id):
     emit({"ok": True, "devices": out})
 
 
-def cmd_play(client_id, device_id, uri):
-    tok, err = access_token(client_id)
-    if not tok:
-        emit({"ok": False, "error": "NO_AUTH", "detail": err})
-    body = {"uris": [uri]} if uri.startswith("spotify:track:") else {"context_uri": uri}
-    r = api(tok, "PUT", "/me/player/play?" + urllib.parse.urlencode({"device_id": device_id}),
-            json=body)
-    # 204 is success; 202 means the device is still waking up.
+def _player_result(r, detail="ok"):
+    """Map a /me/player/* response onto the one-JSON-object contract.
+
+    Shared by every transport command so they cannot drift apart. emit() exits,
+    so these are sequential ifs rather than elifs -- the same shape cmd_play
+    already used.
+    """
     if r.status_code in (200, 202, 204):
-        emit({"ok": True, "detail": "playing"})
-    if r.status_code == 404:
-        emit({"ok": False, "error": "NO_DEVICE",
-              "detail": "Spotify does not see that device. Is librespot running?"})
+        emit({"ok": True, "detail": detail})
+    if r.status_code == 401:
+        emit({"ok": False, "error": "NO_AUTH", "detail": "token rejected -- log in again"})
     if r.status_code == 403:
         emit({"ok": False, "error": "FORBIDDEN",
               "detail": "Spotify refused playback -- Premium is required for this."})
+    if r.status_code == 404:
+        emit({"ok": False, "error": "NO_DEVICE",
+              "detail": "Spotify does not see that device. Is it still running?"})
+    if r.status_code == 429:
+        emit({"ok": False, "error": "RATE_LIMIT",
+              "detail": "rate limited; retry after %s s" % r.headers.get("Retry-After", "?")})
+    if r.status_code in (502, 503, 504):
+        emit({"ok": False, "error": "TRANSIENT", "detail": "HTTP %d" % r.status_code})
     emit({"ok": False, "error": "API", "detail": "HTTP %d: %s" % (r.status_code, r.text[:200])})
+
+
+def _device_query(device_id):
+    return ("?" + urllib.parse.urlencode({"device_id": device_id})) if device_id else ""
+
+
+def cmd_play(client_id, device_id, uris, position_ms=None):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    first = uris[0]
+    if first.startswith("spotify:track:"):
+        # A LIST of track uris, not just one: naming the next track up front
+        # lets Spotify roll straight into it, which is what makes the handover
+        # gapless. A context_uri (album/playlist) cannot express that.
+        body = {"uris": uris}
+    else:
+        body = {"context_uri": first}
+    if position_ms is not None:
+        body["position_ms"] = int(position_ms)
+    r = api(tok, "PUT", "/me/player/play" + _device_query(device_id), json=body)
+    _player_result(r, "playing")
+
+
+def cmd_queue(client_id, device_id, uri):
+    """Append without disturbing what is playing.
+
+    This is the gapless primitive. A PUT /play with a uris list would restart
+    playback, so it is only usable at the START of a track, never mid-track.
+    """
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    q = {"uri": uri}
+    if device_id:
+        q["device_id"] = device_id
+    r = api(tok, "POST", "/me/player/queue?" + urllib.parse.urlencode(q))
+    _player_result(r, "queued")
+
+
+def cmd_pause(client_id, device_id):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    _player_result(api(tok, "PUT", "/me/player/pause" + _device_query(device_id)), "paused")
+
+
+def cmd_resume(client_id, device_id):
+    # An empty body resumes in place; sending uris here would restart the track.
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    _player_result(api(tok, "PUT", "/me/player/play" + _device_query(device_id)), "resumed")
+
+
+def cmd_seek(client_id, device_id, position_ms):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    q = {"position_ms": int(position_ms)}
+    if device_id:
+        q["device_id"] = device_id
+    _player_result(api(tok, "PUT", "/me/player/seek?" + urllib.parse.urlencode(q)), "seeked")
+
+
+def cmd_next(client_id, device_id):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    _player_result(api(tok, "POST", "/me/player/next" + _device_query(device_id)), "skipped")
+
+
+def cmd_transfer(client_id, device_id, play):
+    """Make a device active without necessarily starting a track."""
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    r = api(tok, "PUT", "/me/player", json={"device_ids": [device_id], "play": bool(play)})
+    _player_result(r, "transferred")
+
+
+def cmd_state(client_id):
+    """Flattened /me/player, used to re-anchor against drift and to notice when
+    the user has moved playback to another device."""
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    r = api(tok, "GET", "/me/player")
+    # 204 means "nothing is playing anywhere" -- a normal state, not an error.
+    if r.status_code == 204:
+        emit({"ok": True, "playing": False, "uri": "", "track_id": "",
+              "progress_ms": 0, "duration_ms": 0, "device_id": "", "device_name": ""})
+    if r.status_code != 200:
+        _player_result(r)
+    j = r.json() or {}
+    item = j.get("item") or {}
+    dev = j.get("device") or {}
+    emit({
+        "ok": True,
+        "playing": bool(j.get("is_playing")),
+        "uri": item.get("uri", ""),
+        "track_id": item.get("id", ""),
+        "progress_ms": j.get("progress_ms") or 0,
+        "duration_ms": item.get("duration_ms") or 0,
+        "device_id": dev.get("id", ""),
+        "device_name": dev.get("name", ""),
+        "device_type": dev.get("type", ""),
+        "volume_percent": dev.get("volume_percent") if dev.get("volume_percent") is not None else -1,
+    })
+
+
+# ---------------------------------------------------------------------------
+# librespot provisioning
+# ---------------------------------------------------------------------------
+
+# Where a verified build of librespot can be fetched from, keyed by
+# (sys.platform prefix, machine).
+#
+# SHIPPED EMPTY ON PURPOSE. librespot-org attaches no binaries to its releases,
+# so there is no upstream URL to put here, and mousiki will not download an
+# executable it cannot check. Fill an entry in from the summary printed by
+# .github/workflows/librespot.yml once that workflow has published a release:
+#
+#   ("win32", "AMD64"): {
+#       "version": "0.8.0",
+#       "url": "https://github.com/<owner>/<repo>/releases/download/"
+#              "librespot-v0.8.0/librespot-windows-x86_64.exe",
+#       "sha256": "<the sha256 from the workflow summary>",
+#   },
+#
+# Until then ensure-librespot reports NO_SOURCE and mousiki falls back to the
+# YouTube path, which is exactly what it did before Spotify audio existed.
+LIBRESPOT_BUILDS = {}
+
+BUILD_IT_YOURSELF = (
+    "no verified librespot build is pinned for this platform. Either run the "
+    "librespot workflow in this repository and paste its URL + sha256 into "
+    "LIBRESPOT_BUILDS in scripts/spotify.py, or build it locally with:\n"
+    "    cargo install librespot --locked --no-default-features --features native-tls\n"
+    "and point SpotifyLibrespotPath in config.txt at the result. mousiki only "
+    "uses librespot's pipe backend, which is why the minimal feature set is enough."
+)
+
+
+def librespot_dir():
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or "."
+    return pathlib.Path(home) / ".cache" / "mousiki" / "bin"
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_ensure_librespot(dest=None, url=None, sha256=None):
+    exe = "librespot.exe" if sys.platform == "win32" else "librespot"
+    out_dir = pathlib.Path(dest) if dest else librespot_dir()
+    target = out_dir / exe
+
+    pin = None
+    if url and sha256:
+        pin = {"version": "configured", "url": url, "sha256": sha256.lower()}
+    else:
+        pin = LIBRESPOT_BUILDS.get((sys.platform, platform.machine()))
+
+    # Already present and, if we have something to check it against, correct.
+    if target.exists():
+        if pin is None or _sha256_file(target) == pin["sha256"]:
+            emit({"ok": True, "path": str(target), "cached": True,
+                  "version": pin["version"] if pin else "unknown"})
+        # Present but not what we pinned: a stale download from an older pin, or
+        # something tampered with. Replacing it is the whole point of the check.
+
+    if pin is None:
+        emit({"ok": False, "error": "NO_SOURCE", "detail": BUILD_IT_YOURSELF})
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        with requests.get(pin["url"], stream=True, timeout=120) as r:
+            if r.status_code != 200:
+                emit({"ok": False, "error": "DOWNLOAD",
+                      "detail": "HTTP %d fetching %s" % (r.status_code, pin["url"])})
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    if chunk:
+                        f.write(chunk)
+    except requests.RequestException as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        emit({"ok": False, "error": "NETWORK", "detail": str(e)})
+
+    got = _sha256_file(tmp)
+    if got != pin["sha256"]:
+        # Deleted rather than kept: a binary that failed its checksum must not
+        # be left lying somewhere a later run might pick up.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        emit({"ok": False, "error": "CHECKSUM",
+              "detail": "expected %s, got %s -- refusing to install" % (pin["sha256"], got)})
+
+    if sys.platform != "win32":
+        os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    emit({"ok": True, "path": str(target), "cached": False, "version": pin["version"]})
 
 
 def main():
     args = sys.argv[1:]
     if not args:
-        fail("USAGE", "spotify.py <login|status|playlists|tracks|saved|search|devices|play> ...")
+        fail("USAGE", "spotify.py <login|status|playlists|tracks|saved|search|devices|state|play|queue|pause|resume|seek|next|transfer|ensure-librespot> ...")
 
     client_id = os.environ.get("MOUSIKI_SPOTIFY_CLIENT_ID", "")
     if "--client-id" in args:
@@ -452,8 +681,46 @@ def main():
             cmd_devices(client_id)
         elif cmd == "play":
             if len(rest) < 2:
-                fail("USAGE", "play <device_id> <spotify_uri>")
-            cmd_play(client_id, rest[0], rest[1])
+                fail("USAGE", "play <device_id> <uri> [uri...] [--position-ms N]")
+            pos = None
+            if "--position-ms" in rest:
+                i = rest.index("--position-ms")
+                if i + 1 >= len(rest):
+                    fail("USAGE", "--position-ms needs a value")
+                pos = rest[i + 1]
+                rest = rest[:i] + rest[i + 2:]
+            if len(rest) < 2:
+                fail("USAGE", "play <device_id> <uri> [uri...] [--position-ms N]")
+            cmd_play(client_id, rest[0], rest[1:], pos)
+        elif cmd == "queue":
+            if len(rest) < 2:
+                fail("USAGE", "queue <device_id> <spotify_uri>")
+            cmd_queue(client_id, rest[0], rest[1])
+        elif cmd == "pause":
+            cmd_pause(client_id, rest[0] if rest else "")
+        elif cmd == "resume":
+            cmd_resume(client_id, rest[0] if rest else "")
+        elif cmd == "seek":
+            if not rest:
+                fail("USAGE", "seek <position_ms> [device_id]")
+            cmd_seek(client_id, rest[1] if len(rest) > 1 else "", rest[0])
+        elif cmd == "next":
+            cmd_next(client_id, rest[0] if rest else "")
+        elif cmd == "transfer":
+            if not rest:
+                fail("USAGE", "transfer <device_id> [--play]")
+            cmd_transfer(client_id, rest[0], "--play" in rest)
+        elif cmd == "state":
+            cmd_state(client_id)
+        elif cmd == "ensure-librespot":
+            dest = url = sha = None
+            if "--dest" in rest:
+                dest = rest[rest.index("--dest") + 1]
+            if "--url" in rest:
+                url = rest[rest.index("--url") + 1]
+            if "--sha256" in rest:
+                sha = rest[rest.index("--sha256") + 1]
+            cmd_ensure_librespot(dest, url, sha)
         else:
             fail("USAGE", "unknown subcommand: %s" % cmd)
     except requests.RequestException as e:

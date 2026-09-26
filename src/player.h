@@ -2,12 +2,12 @@
 #include <atomic>
 #include <memory>
 #include "miniaudio.h"
-#include "streaming_pcm.h"
+#include "pcm_ring.h"
 #include "fft_visualizer.h"
 
 namespace muisc {
 
-// Plays back a StreamingPcm buffer through a real audio device via
+// Plays back a PcmRing through a real audio device via
 // miniaudio, using the backend pinned in audio_backend.h
 // (PulseAudio/ALSA -> PipeWire on Linux, WASAPI on Windows, OpenSL ES on
 // Android).
@@ -39,18 +39,41 @@ public:
     // the device down. `fft_sink`, if given, gets push_samples() called
     // from the audio callback with each chunk actually played (nullptr
     // to disable — e.g. not needed for a plain smoke test).
-    bool play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volume_pct,
+    bool play(std::shared_ptr<PcmRing> pcm, double start_sec, int volume_pct,
               FftVisualizer* fft_sink = nullptr);
+
+    // Switches to another buffer WITHOUT tearing the audio device down.
+    //
+    // play() cannot be used at a gapless boundary: its first act is stop(),
+    // i.e. ma_device_uninit followed by a fresh init, which is tens of
+    // milliseconds of silence -- audible as a gap between album tracks, which
+    // is the exact thing gapless playback exists to avoid.
+    //
+    // Safe against the live callback by double-buffering: the callback reads
+    // whichever slot `active_slot_` names, and this fills the OTHER slot before
+    // flipping it. Nothing the callback might be mid-read on is reassigned, and
+    // the outgoing buffer stays alive in its slot rather than being freed
+    // underneath it.
+    void adopt_ring(std::shared_ptr<PcmRing> ring, double start_sec);
 
     void pause();
     void resume();
     bool is_paused() const { return paused_; }
 
-    void seek_relative(double delta_sec);
+    // Seek within what the ring still holds. Returns false when the target is
+    // outside it, which means the caller must restart the producer at that
+    // offset instead (App::seek_to does exactly that).
+    bool try_seek_in_window(double target_sec);
+    // Move the cursor for a seek that IS being served by a producer restart.
+    // Must run BEFORE the restart is requested: it clears finished_, without
+    // which the empty window the restart briefly creates is read as
+    // end-of-track and the run loop skips to the next song.
+    void rebase_for_restart(double target_sec);
     void set_volume(int volume_pct);
     int volume() const { return volume_pct_.load(); }
 
     double poll_elapsed() const;
+    double position_seconds() const { return poll_elapsed(); }
     bool finished() const { return finished_.load(); }
     // Synchronously clears a stale finished flag left over from the
     // previous track. play() itself resets this too, but play() now
@@ -70,7 +93,10 @@ private:
     ma_device device_{};
     bool device_ready_ = false;
 
-    std::shared_ptr<StreamingPcm> pcm_;
+    // Two slots rather than one pointer, so adopt_ring() can hand the callback
+    // a new buffer without a lock and without freeing the old one.
+    std::shared_ptr<PcmRing> pcm_slots_[2];
+    std::atomic<int> active_slot_{0};
     FftVisualizer* fft_sink_ = nullptr;
     // These are read from the main/render thread every frame while the
     // device worker thread may be inside play(). They are atomics rather than
@@ -84,9 +110,12 @@ private:
     std::atomic<float> gain_{0.7f};
     std::atomic<bool> paused_{false};
     std::atomic<int> volume_pct_{70};
-    // Reserved capacity of the current buffer, cached so seek_relative() never
-    // has to touch the pcm_ shared_ptr the worker thread may be reassigning.
-    std::atomic<long long> capacity_frames_{0};
+    // Highest frame the producer has published, mirrored out of the ring by
+    // the audio callback. The main thread needs this to decide whether a
+    // forward seek is already decoded, and mirroring it through an atomic
+    // preserves the rule above: the main thread never dereferences pcm_, which
+    // the device worker may be reassigning at the same moment.
+    std::atomic<long long> decoded_hi_frames_{0};
 
     static void data_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count);
 };

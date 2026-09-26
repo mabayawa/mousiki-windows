@@ -672,6 +672,10 @@ static Settings load_from_config(const fs::path& path) {
             s.spotify_librespot_path = p;
             continue;
         }
+        if (key == "SpotifyPrefetch" || key == "spotify_prefetch") {
+            s.spotify_prefetch = parse_bool(value);
+            continue;
+        }
 
         // --- Local music library paths ---
         // Each LocalMusicPath= line appends one directory.
@@ -916,6 +920,7 @@ void save_settings(const Settings& s) {
     out << "\n# Spotify\n";
     out << "SpotifyClientId=" << s.spotify_client_id << "\n";
     out << "SpotifyLibrespotPath=" << s.spotify_librespot_path << "\n";
+    out << "SpotifyPrefetch=" << (s.spotify_prefetch ? "1" : "0") << "\n";
     out << "\n# Local Music Paths\n";
     for (const auto& path : s.local_music_paths) {
         out << "LocalMusicPath=" << path << "\n";

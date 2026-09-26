@@ -154,8 +154,13 @@ struct Settings {
     // Blank client id disables the feature entirely, which is the default:
     // the id belongs to whoever runs mousiki, not to the repository.
     std::string spotify_client_id;
-    // Blank means "find librespot on PATH".
+    // Blank means: use the managed download in the cache dir, else find
+    // librespot on PATH.
     std::string spotify_librespot_path;
+    // Hand Spotify the next track before the current one ends, so librespot
+    // rolls into it with no gap. Only applies to librespot playback -- there is
+    // nothing to prefetch when the desktop app is the one making the sound.
+    bool spotify_prefetch = true;
 
     // --- hotkey mapping ------------------------------------------------
     // Action name → key string (e.g. "ARROW_KEY_UP", "s", "ENTER")

@@ -14,29 +14,37 @@ void Player::data_callback(ma_device* device, void* output, const void* /*input*
     float* out = static_cast<float*>(output);
 
     const int ch = static_cast<int>(device->playback.channels);
+    const size_t total_samples = static_cast<size_t>(frame_count) * static_cast<size_t>(ch);
 
-    if (!self || !self->pcm_ || self->paused_.load()) {
-        std::memset(out, 0, static_cast<size_t>(frame_count) * ch * sizeof(float));
+    // Read the slot index once: a swap partway through this call simply means we
+    // finish with the buffer we started on, which is correct.
+    PcmRing* ring_ptr =
+        self ? self->pcm_slots_[self->active_slot_.load(std::memory_order_acquire)].get() : nullptr;
+    if (!ring_ptr) {
+        std::memset(out, 0, total_samples * sizeof(float));
         return;
     }
 
-    StreamingPcm& pcm = *self->pcm_;
-    long long cur = self->cursor_frames_.load();   // in FRAMES
-    float gain = self->gain_.load();
-    // Acquire-load: pairs with the release-store in StreamingPcm::append(),
-    // guaranteeing every index below `avail` was fully written by the
-    // decode thread before we read it here. Counted in samples, so the
-    // comparisons below scale the frame cursor by the channel count.
-    size_t avail = pcm.available.load(std::memory_order_acquire);
+    PcmRing& ring = *ring_ptr;
+    // Ticked before the paused early-return, not after: begin_epoch() waits on
+    // these ticks to know no reader is still inside the window it is about to
+    // move, and a paused callback that stopped ticking would stall every seek
+    // until the wait timed out.
+    ring.tick();
 
-    for (ma_uint32 i = 0; i < frame_count; ++i) {
-        long long frame = cur + static_cast<long long>(i);
-        size_t base = static_cast<size_t>(frame) * static_cast<size_t>(ch);
-        bool have = frame >= 0 && (base + static_cast<size_t>(ch)) <= avail;
-        for (int c = 0; c < ch; ++c) {
-            out[static_cast<size_t>(i) * ch + c] = have ? pcm.data[base + c] * gain : 0.0f;
-        }
+    if (self->paused_.load()) {
+        std::memset(out, 0, total_samples * sizeof(float));
+        return;
     }
+
+    const long long cur = self->cursor_frames_.load();
+    const float gain = self->gain_.load();
+
+    // One bulk copy with the gaps zero-filled, instead of the old per-sample
+    // bounds test. Strictly cheaper than what it replaces, and it keeps the
+    // acquire/release pairing inside the ring where the contract is documented.
+    ring.read(cur, out, frame_count);
+    for (size_t i = 0; i < total_samples; ++i) out[i] *= gain;
 
     // The spectrum analyser wants one signal, not one per channel -- a stereo
     // FFT would mean drawing two spectra. Sum to mono here, which is what any
@@ -58,19 +66,25 @@ void Player::data_callback(ma_device* device, void* output, const void* /*input*
         }
     }
 
-    long long new_cur = cur + static_cast<long long>(frame_count);
-    // Only truly "finished" once decode is done AND playback has caught
-    // all the way up to everything it ever produced — not just the
-    // current available count, which may still be growing while we play.
-    if (pcm.decode_done.load() && new_cur >= 0 &&
-        static_cast<size_t>(new_cur) * static_cast<size_t>(ch) >=
-            pcm.available.load(std::memory_order_acquire)) {
+    const long long new_cur = cur + static_cast<long long>(frame_count);
+    const long long hi = ring.decoded_hi_frames();
+    // Mirrored for the main thread's forward-seek test -- see player.h.
+    self->decoded_hi_frames_.store(hi, std::memory_order_relaxed);
+
+    // Only truly "finished" once the producer is done AND playback has caught
+    // up to everything it ever produced. During a seek restart the window is
+    // briefly empty, which would satisfy the second half on its own -- but
+    // begin_epoch() clears decode_done before closing the window, so this
+    // cannot misfire and skip the track the user just seeked within.
+    if (ring.decode_done.load(std::memory_order_acquire) && new_cur >= hi) {
         self->finished_.store(true);
     }
     self->cursor_frames_.store(new_cur);
+    // Publishing the cursor is what releases ring space back to the producer.
+    ring.publish_cursor(new_cur);
 }
 
-bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volume_pct,
+bool Player::play(std::shared_ptr<PcmRing> pcm, double start_sec, int volume_pct,
                    FftVisualizer* fft_sink) {
     stop();
     if (!pcm) return false;
@@ -81,14 +95,16 @@ bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volum
         // falls back to miniaudio's own default backend selection.
     }
 
-    pcm_ = std::move(pcm);
+    active_slot_.store(0, std::memory_order_release);
+    pcm_slots_[0] = std::move(pcm);
+    pcm_slots_[1].reset();
+    PcmRing* ring = pcm_slots_[0].get();
     fft_sink_ = fft_sink;
-    sample_rate_.store(pcm_->sample_rate > 0 ? pcm_->sample_rate : 44100);
+    sample_rate_.store(ring->sample_rate > 0 ? ring->sample_rate : 44100);
     volume_pct_.store(std::clamp(volume_pct, 0, 100));
     gain_.store(volume_pct_.load() / 100.0f);
-    // capacity() counts interleaved samples; the cursor counts frames.
-    int ch = pcm_->channels > 0 ? pcm_->channels : 1;
-    capacity_frames_.store(static_cast<long long>(pcm_->data.capacity() / static_cast<size_t>(ch)));
+    int ch = ring->channels > 0 ? ring->channels : 1;
+    decoded_hi_frames_.store(ring->decoded_hi_frames());
     finished_.store(false);
     paused_.store(false);
     cursor_frames_.store(static_cast<long long>(std::max(0.0, start_sec) * sample_rate_.load()));
@@ -103,7 +119,7 @@ bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volum
     ma_context* ctx = context_ready_ ? &context_ : nullptr;
     ma_result init_res = ma_device_init(ctx, &cfg, &device_);
     if (init_res != MA_SUCCESS) {
-        pcm_.reset();
+        pcm_slots_[0].reset();
         ConsoleLog::instance().log_verbose(
             std::string("audio: ma_device_init failed: ") + ma_result_description(init_res));
         return false;
@@ -111,7 +127,7 @@ bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volum
     ma_result start_res = ma_device_start(&device_);
     if (start_res != MA_SUCCESS) {
         ma_device_uninit(&device_);
-        pcm_.reset();
+        pcm_slots_[0].reset();
         ConsoleLog::instance().log_verbose(
             std::string("audio: ma_device_start failed: ") + ma_result_description(start_res));
         return false;
@@ -126,24 +142,58 @@ bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volum
     return true;
 }
 
+void Player::adopt_ring(std::shared_ptr<PcmRing> ring, double start_sec) {
+    if (!ring) return;
+    const int cur = active_slot_.load(std::memory_order_acquire);
+    const int next = 1 - cur;
+    // Filled before the flip, so the callback never observes a half-assigned
+    // shared_ptr. The outgoing buffer stays in its slot and is only released on
+    // the NEXT adopt, by which point no callback can still be inside it.
+    pcm_slots_[next] = std::move(ring);
+    const int rate = pcm_slots_[next]->sample_rate > 0 ? pcm_slots_[next]->sample_rate : 44100;
+    sample_rate_.store(rate);
+    cursor_frames_.store(static_cast<long long>(std::max(0.0, start_sec) * rate));
+    decoded_hi_frames_.store(pcm_slots_[next]->decoded_hi_frames());
+    finished_.store(false);
+    active_slot_.store(next, std::memory_order_release);
+}
+
 void Player::pause() { paused_.store(true); }
 void Player::resume() { paused_.store(false); }
 
-void Player::seek_relative(double delta_sec) {
-    // Clamp against reserved capacity (the eventual max), not the
-    // currently-decoded amount — seeking a bit ahead of what's decoded
-    // so far is fine, it just plays silence until decode catches up.
-    //
-    // Read from the cached atomic rather than pcm_->data.capacity(): this runs
-    // on the main thread, and the device worker may be reassigning pcm_ at the
-    // same moment.
-    long long cap = capacity_frames_.load();
-    if (cap <= 0) return;
-    long long delta_frames = static_cast<long long>(delta_sec * sample_rate_.load());
-    long long cur = cursor_frames_.load();
-    long long next = std::clamp<long long>(cur + delta_frames, 0, cap);
-    cursor_frames_.store(next);
-    if (next < cap) finished_.store(false);
+bool Player::try_seek_in_window(double target_sec) {
+    const int rate = sample_rate_.load();
+    if (rate <= 0) return false;
+    const long long tgt = static_cast<long long>(target_sec * rate);
+    if (tgt < 0) return false;
+    const long long cur = cursor_frames_.load();
+
+    if (tgt <= cur) {
+        // Backward. The ring guarantees kHistoryFrames behind the cursor, less
+        // a margin: between this test and the store below, the callback can
+        // advance retain_floor_ by up to a device period, dragging the resident
+        // base forward by the same amount. Half a second is ~25 periods of
+        // slack, and still admits an 11.4 s jump -- so a -5 s tap, or two in a
+        // row, never costs a decoder restart.
+        const long long margin = rate / 2;
+        if (cur - tgt > static_cast<long long>(kHistoryFrames) - margin) return false;
+    } else {
+        // Forward. Exact test against what has actually been produced; no
+        // margin needed, since a false negative only costs a restart that was
+        // not strictly necessary.
+        if (tgt >= decoded_hi_frames_.load()) return false;
+    }
+
+    cursor_frames_.store(tgt);
+    finished_.store(false);
+    return true;
+}
+
+void Player::rebase_for_restart(double target_sec) {
+    const int rate = sample_rate_.load();
+    if (rate <= 0) return;
+    cursor_frames_.store(static_cast<long long>(std::max(0.0, target_sec) * rate));
+    finished_.store(false);
 }
 
 void Player::set_volume(int volume_pct) {
@@ -159,13 +209,15 @@ double Player::poll_elapsed() const {
 
 void Player::stop() {
     // ma_device_uninit() must come first: it stops the audio callback, so by
-    // the time pcm_ is released nothing can still be reading through it.
+    // the time the buffers are released nothing can still be reading them.
     if (device_ready_) {
         ma_device_uninit(&device_);
         device_ready_ = false;
     }
-    capacity_frames_.store(0);
-    pcm_.reset();
+    decoded_hi_frames_.store(0);
+    pcm_slots_[0].reset();
+    pcm_slots_[1].reset();
+    active_slot_.store(0, std::memory_order_release);
     fft_sink_ = nullptr;
 }
 
