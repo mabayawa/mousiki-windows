@@ -32,6 +32,17 @@ void Player::data_callback(ma_device* device, void* output, const void* /*input*
     // until the wait timed out.
     ring.tick();
 
+    // The outgoing track ended the moment the user asked for a new one --
+    // see begin_track_switch(). Emit silence, and critically do NOT advance
+    // cursor_frames_ or raise finished_ on the way out: the cursor is the
+    // clock the entire UI reads (progress bar, timestamp, lyric highlighting),
+    // and a finished_ raised here would make the main loop's
+    // "has_track_ && finished()" check skip the track that is about to start.
+    if (self->switching_.load(std::memory_order_acquire)) {
+        std::memset(out, 0, total_samples * sizeof(float));
+        return;
+    }
+
     if (self->paused_.load()) {
         std::memset(out, 0, total_samples * sizeof(float));
         return;
@@ -108,6 +119,10 @@ bool Player::play(std::shared_ptr<PcmRing> pcm, double start_sec, int volume_pct
     finished_.store(false);
     paused_.store(false);
     cursor_frames_.store(static_cast<long long>(std::max(0.0, start_sec) * sample_rate_.load()));
+    // The incoming ring is in its slot and the clock is rebased, so the switch
+    // is over. Cleared before ma_device_init so the very first callback of the
+    // new device already plays audio rather than one period of silence.
+    switching_.store(false, std::memory_order_release);
 
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format = ma_format_f32;
@@ -155,7 +170,21 @@ void Player::adopt_ring(std::shared_ptr<PcmRing> ring, double start_sec) {
     cursor_frames_.store(static_cast<long long>(std::max(0.0, start_sec) * rate));
     decoded_hi_frames_.store(pcm_slots_[next]->decoded_hi_frames());
     finished_.store(false);
+    switching_.store(false, std::memory_order_release);
     active_slot_.store(next, std::memory_order_release);
+}
+
+void Player::begin_track_switch() {
+    // Order matters. The flag goes up FIRST: once the callback observes it, it
+    // stops touching cursor_frames_ and finished_, so the zeroing below cannot
+    // be overwritten by a callback that was already in flight. Zeroing first
+    // would leave a window where the callback stores cur + frame_count over
+    // the top of it and the clock resumes counting from the old position --
+    // the exact carry-over this function exists to remove.
+    switching_.store(true, std::memory_order_release);
+    cursor_frames_.store(0);
+    decoded_hi_frames_.store(0);
+    finished_.store(false);
 }
 
 void Player::pause() { paused_.store(true); }
