@@ -298,6 +298,7 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyPlay",                        "ENTER"},
             {"HKeySearch",                      "/"},
             {"HKeySearchOnline",                "/s:"},
+            {"HKeySearchSpotify",               "/sp:"},
             {"HKeyPlayNextSong",                "n"},
             {"HKeyPlayPreviousSong",            "b"},
             {"HKeySeekForward",                 "ARROW_KEY_RIGHT"},
@@ -306,6 +307,7 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyDecreaseVolume",              "2"},
             {"HKeyAddHoveringSongToQueue",      "a"},
             {"HKeyRemoveHoveringSongFromQueue", "d"},
+            {"HKeyBulkAddPlaylist",             "g"},
             {"HKeySwitchBetweenCards",          "TAB"},
             {"HKeyTogglePlayPause",             "p"},
             {"HKeyCyclePlayMode",               "m"},
@@ -930,8 +932,10 @@ void save_settings(const Settings& s) {
     static const char* hkey_order[] = {
         "HKeyNavigateUp", "HKeyNavigateDown", "HKeyPlay", "HKeyPlayNextSong", "HKeyPlayPreviousSong",
         "HKeyTogglePlayPause", "HKeyCyclePlayMode", "HKeySearch", "HKeySearchOnline",
+        "HKeySearchSpotify",
         "HKeySeekForward", "HKeySeekBackward", "HKeyIncreaseVolume", "HKeyDecreaseVolume",
-        "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeySwitchBetweenCards",
+        "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeyBulkAddPlaylist",
+        "HKeySwitchBetweenCards",
         "HKeyFilterForFolder", "HKeyClearFilter", "HKeyQuit", "HKeyResetPreference", "HKeyDownloadStream",
     };
     for (const char* name : hkey_order) {

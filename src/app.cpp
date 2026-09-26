@@ -594,6 +594,7 @@ void App::submit_search() {
         }
         last_online_query_ = query;
         list_source_ = ListSource::Online;
+        last_online_was_spotify_ = true;
         if (search_in_progress_.load()) {
             status_line_ = "still searching, hang on ...";
             return;
@@ -607,6 +608,7 @@ void App::submit_search() {
         while (!query.empty() && query.front() == ' ') query.erase(query.begin());
         last_online_query_ = query;
         list_source_ = ListSource::Online;
+        last_online_was_spotify_ = false;
         if (search_in_progress_.load()) {
             status_line_ = "still searching, hang on ...";
             return;
@@ -1200,6 +1202,15 @@ void App::play_next_from_queue() {
         std::uniform_int_distribution<int> dist(0, static_cast<int>(queue_.size()) - 1);
         idx = dist(rng);
     }
+    play_queue_index(idx);
+}
+
+// The one place a queue item is consumed. Both entry points land here -- the
+// automatic advance (via play_next_from_queue() above) and an explicit Enter on
+// a queue row -- so the two can never disagree about what "taking an item off
+// the queue" means.
+void App::play_queue_index(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(queue_.size())) return;
     QueueItem item = queue_[idx];
     queue_.erase(queue_.begin() + idx);
     if (settings_.play_mode == 4 /*repeat queue*/) {
@@ -1207,6 +1218,10 @@ void App::play_next_from_queue() {
     }
     if (queue_selected_ >= idx && queue_selected_ > 0) --queue_selected_; // index shifted down by the erase
     clamp_queue_selected();
+    start_queue_item(item);
+}
+
+void App::start_queue_item(const QueueItem& item) {
     if (item.is_local) {
         LocalTrack t{path_utf8(fs::path(item.local_path).stem()), item.local_path, item.artist};
         start_local_track(t);
@@ -1276,17 +1291,54 @@ char App::play_mode_letter() const {
     }
 }
 
-void App::queue_add_selected() {
+std::string App::queue_add_selected() {
     size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
-    if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return;
+    if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return std::string();
+    std::string title;
     if (list_source_ == ListSource::Local) {
         const auto& t = local_view_[selected_];
         queue_.push_back({true, t.title, t.folder_artist, t.path, ""});
+        title = t.title;
     } else {
         const auto& r = online_view_[selected_];
         queue_.push_back({false, r.title, r.uploader, {}, r.video_id, r.spotify_uri, r.duration_sec});
+        title = r.title;
     }
     clamp_queue_selected();
+    return title;
+}
+
+// Identity, not position: the same rule current_track_list_index() applies, and
+// for the same reason -- every Spotify row carries an empty video_id, so a
+// video_id-only match made all of them match each other.
+bool App::queue_item_is_current(const QueueItem& item) const {
+    if (!has_track_) return false;
+    if (item.is_local != current_is_local_) return false;
+    if (item.is_local) return !current_path_.empty() && item.local_path == current_path_;
+    if (!current_spotify_uri_.empty()) return item.spotify_uri == current_spotify_uri_;
+    return !current_video_id_.empty() && item.video_id == current_video_id_;
+}
+
+bool App::list_row_in_queue(int idx) const {
+    if (idx < 0) return false;
+    if (list_source_ == ListSource::Local) {
+        if (idx >= static_cast<int>(local_view_.size())) return false;
+        const fs::path& p = local_view_[idx].path;
+        for (const auto& q : queue_) {
+            if (q.is_local && q.local_path == p) return true;
+        }
+        return false;
+    }
+    if (idx >= static_cast<int>(online_view_.size())) return false;
+    const auto& r = online_view_[idx];
+    for (const auto& q : queue_) {
+        if (q.is_local) continue;
+        // Spotify rows are identified by URI (their video_id is empty until
+        // something resolves one); YouTube rows by video_id.
+        if (!r.spotify_uri.empty()) { if (q.spotify_uri == r.spotify_uri) return true; }
+        else if (!r.video_id.empty() && q.video_id == r.video_id) return true;
+    }
+    return false;
 }
 
 void App::queue_remove_last() {
@@ -1522,8 +1574,9 @@ static const char* kRefHotkeyNames[] = {
     "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeySwitchBetweenCards",
     "HKeyFilterForFolder", "HKeyClearFilter", "HKeyDownloadStream",
     "HKeyRefreshUi", "HKeyConsole", "HKeyToggleMute", "HKeyCheatsheet", "HKeyRetryLyrics",
+    "HKeySearchSpotify", "HKeyBulkAddPlaylist",
 };
-static constexpr int kRefRowCount = 25;
+static constexpr int kRefRowCount = 27;
 
 std::string* App::color_field_ptr(int row, int col) {
     switch (row) {
@@ -2600,28 +2653,45 @@ void App::handle_key(int key) {
                   // "previous" once an item's been consumed.
             play_relative(-1);
             break;
-        case 'a': // add hovering song to queue (List focus) -- or, when
-                  // the Queue panel itself is focused, "a" has nothing
-                  // hovering-in-the-list to add, so it opens the bulk-add
-                  // panel instead (paste a YouTube playlist link, queue
-                  // everything in it).
-            if (queue_focus_) {
-                mode_ = Mode::BulkAdd;
-                bulk_add_buffer_.clear();
-                bulk_add_results_ready_ = false;
-                pending_bulk_add_ = BulkAddResult{};
-                bulk_add_selected_.clear();
-                bulk_add_cursor_ = 0;
-                bulk_add_scroll_ = 0;
-                status_line_.clear();
-            } else {
-                queue_add_selected();
-                log_event("added to queue");
+        case 'a': // add the hovering song to the queue -- from EITHER panel.
+                  //
+                  // This used to open the bulk-add panel instead whenever the
+                  // Queue panel happened to be focused, on the reasoning that
+                  // "a" then had nothing hovering-in-the-list to add. But it
+                  // always does: Tab only moves which panel the arrow keys
+                  // drive, it does not unhover the list row. So the most
+                  // natural way to reach for this -- focus the queue, then
+                  // add -- silently landed in a "paste a YouTube playlist
+                  // link" prompt, which reads as "I cannot add to the queue".
+                  // Bulk add has its own key now (see 'g').
+            {
+                const std::string added = queue_add_selected();
+                // Named, not a bare "added to queue": with the queue panel
+                // scrolled, or off entirely (ElimentQueue=false), the status
+                // line is the only confirmation that anything happened.
+                if (!added.empty()) log_event("added to queue: " + added);
+                else log_event("nothing to add -- hover a track in the list first");
             }
             break;
+        case 'g': case 'G': // bulk add: paste a YouTube playlist link, queue all of it
+            mode_ = Mode::BulkAdd;
+            bulk_add_buffer_.clear();
+            bulk_add_results_ready_ = false;
+            pending_bulk_add_ = BulkAddResult{};
+            bulk_add_selected_.clear();
+            bulk_add_cursor_ = 0;
+            bulk_add_scroll_ = 0;
+            status_line_.clear();
+            break;
         case 'd': // remove hovering queue item
-            queue_remove_hovering();
-            log_event("removed from queue");
+            {
+                const std::string removed =
+                    (queue_selected_ >= 0 && queue_selected_ < static_cast<int>(queue_.size()))
+                        ? queue_[queue_selected_].title : std::string();
+                queue_remove_hovering();
+                if (!removed.empty()) log_event("removed from queue: " + removed);
+                else log_event("queue is empty -- nothing to remove");
+            }
             break;
         case 'm': case 'M': // cycle play mode: list -> repeat -> shuffle
                              // -> repeat queue -> stop -> list -- one key
@@ -2736,7 +2806,13 @@ void App::handle_key(int key) {
             log_event(std::string("sort: ") + sort_mode_name(local_sort_mode_));
             break;
         case '\r': case '\n':
-            play_selected();
+            // Enter follows the focus. It used to always play the LIST row,
+            // so once you Tab'd into the queue there was no way to play a
+            // particular queue item at all -- only "n", which takes the
+            // front. The item is consumed exactly as an automatic advance
+            // would consume it (see play_queue_index()).
+            if (queue_focus_ && !queue_.empty()) play_queue_index(queue_selected_);
+            else play_selected();
             break;
         case '/':
             mode_ = Mode::Search;
@@ -3285,15 +3361,26 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     return out;
 }
 std::vector<std::string> App::build_search_bar(int total_width) const {
-    std::string label = (list_source_ == ListSource::Online) ? "SEARCH ONLINE" : "SEARCH LOCAL";
+    // Spotify and YouTube results share one type, so a "sp:" search used to
+    // label itself "SEARCH ONLINE" and echo back as "/s:<query>". Wrong on its
+    // face -- and worse, this bar is the only place the prefixes are ever
+    // shown, so mislabelling it is how "sp:" stayed unknown.
+    std::string label = (list_source_ == ListSource::Online)
+                            ? (last_online_was_spotify_ ? "SEARCH SPOTIFY" : "SEARCH ONLINE")
+                            : "SEARCH LOCAL";
 
     std::string content;
     if (mode_ == Mode::Search) {
         content = "/" + search_buffer_ + "\u2588"; // block cursor
     } else if (list_source_ == ListSource::Online) {
-        content = "/s:" + last_online_query_;
+        content = (last_online_was_spotify_ ? "/sp:" : "/s:") + last_online_query_;
     } else {
         content = "/l:" + last_local_query_;
+    }
+    // An empty box is exactly where someone lands who pressed "/" without
+    // knowing what to type. Spend that space naming the prefixes.
+    if (mode_ == Mode::Search && search_buffer_.empty()) {
+        content += "  (plain = local, s: = youtube, sp: = spotify)";
     }
 
     std::string border_ansi = ansi_for(settings_.border_color, false);
@@ -3329,21 +3416,26 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
         int idx = scroll_ + row;
         std::string content;
         if (idx < static_cast<int>(total)) {
+            // One column flagging "this row is already in your queue". A new
+            // search replaces the results wholesale, so without it there is no
+            // way to see what you already took from the previous search --
+            // which is the whole of building a queue across several searches.
+            const std::string mark = list_row_in_queue(idx) ? "•" : " ";
             if (online) {
                 const auto& r = online_view_[idx];
                 const int uploader_w = 18;
-                int title_w = std::max(5, inner - idx_w - 2 - 2 - uploader_w);
+                int title_w = std::max(5, inner - idx_w - 1 - 2 - 2 - uploader_w);
                 std::string t_idx = apply_font_map(std::to_string(idx + 1), settings_.font_map);
                 std::string t_title = apply_font_map(r.title, settings_.font_map);
                 std::string t_uploader = apply_font_map(r.uploader, settings_.font_map);
-                content = pad_right(t_idx, idx_w) + settings_.list_separator + " "
+                content = pad_right(t_idx, idx_w) + mark + settings_.list_separator + " "
                         + pad_right(truncate_str(t_title, title_w), title_w) + settings_.list_separator + " "
                         + pad_right(truncate_str(t_uploader, uploader_w), uploader_w);
             } else {
                 const auto& t = local_view_[idx];
                 const int artist_w = 16;
                 const int dur_w = 5;
-                int title_w = std::max(5, inner - idx_w - 2 - 2 - artist_w - 2 - dur_w);
+                int title_w = std::max(5, inner - idx_w - 1 - 2 - 2 - artist_w - 2 - dur_w);
                 double dur = -1;
                 // BUGFIX: this was always the parent-folder name, even
                 // though the metadata panel already reads the real ffprobe
@@ -3363,15 +3455,27 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
                 std::string t_title = apply_font_map(t.title, settings_.font_map);
                 std::string t_artist = apply_font_map(artist, settings_.font_map);
                 std::string t_dur = apply_font_map(fmt_mmss(dur), settings_.font_map);
-                content = pad_right(t_idx, idx_w) + settings_.list_separator + " "
+                content = pad_right(t_idx, idx_w) + mark + settings_.list_separator + " "
                         + pad_right(truncate_str(t_title, title_w), title_w) + settings_.list_separator + " "
                         + pad_right(truncate_str(t_artist, artist_w), artist_w) + settings_.list_separator + " "
                         + t_dur;
             }
         }
         bool sel = (idx == selected_) && idx < static_cast<int>(total);
-        bool is_playing_row = has_track_ && !online && idx < static_cast<int>(total)
-                               && local_view_[idx].path == current_path_;
+        // This was local-only, so the Spotify/YouTube row that was actually
+        // playing never highlighted and the whole online list looked inert.
+        // Same identity rule as current_track_list_index(): URI first, since
+        // every Spotify row carries an empty video_id, video_id otherwise.
+        bool is_playing_row = false;
+        if (has_track_ && idx < static_cast<int>(total)) {
+            if (!online) {
+                is_playing_row = current_is_local_ && local_view_[idx].path == current_path_;
+            } else if (!current_is_local_) {
+                const auto& r = online_view_[idx];
+                if (!current_spotify_uri_.empty()) is_playing_row = (r.spotify_uri == current_spotify_uri_);
+                else if (!current_video_id_.empty()) is_playing_row = (r.video_id == current_video_id_);
+            }
+        }
         std::string bar = border_ansi + settings_.box_vertical + "\x1b[0m";
         std::string padded = pad_right(truncate_str(content, inner), inner);
         if (sel) {
@@ -3406,8 +3510,13 @@ std::vector<std::string> App::build_queue_panel(int total_width, int height) con
         int mid_row = height / 2;
         for (int row = 0; row < height; ++row) {
             std::string content;
-            if (row == mid_row) {
-                std::string text = apply_font_map("ADD TRACKS TO QUEUE", settings_.font_map);
+            // Two lines, because the second one is the part that was
+            // missing: this is the panel a person stares at while wondering
+            // how to fill it, and it never said which key does it.
+            if (row == mid_row || row == mid_row + 1) {
+                const char* raw = (row == mid_row) ? "ADD TRACKS TO QUEUE"
+                                                   : "[a] add the hovered track";
+                std::string text = apply_font_map(raw, settings_.font_map);
                 int left = std::max(0, (inner - display_width(text)) / 2);
                 content = std::string(left, ' ') + text;
             }
@@ -3423,10 +3532,28 @@ std::vector<std::string> App::build_queue_panel(int total_width, int height) con
             bool is_row_hovering = false;
             if (idx < static_cast<int>(queue_.size())) {
                 const auto& q = queue_[idx];
+                // The artist earns its column here more than in the list: a
+                // queue built from Spotify searches is otherwise a wall of
+                // titles, and the same title under different artists is the
+                // norm rather than the exception. Sized off the panel so a
+                // narrow terminal drops it rather than crushing the title.
+                const int idx_w = 3;
+                const int artist_w = std::min(14, std::max(0, inner / 3));
+                const int title_w =
+                    std::max(5, inner - idx_w - 2 - (artist_w > 0 ? artist_w + 2 : 0));
                 std::string t_idx = apply_font_map(std::to_string(idx + 1), settings_.font_map);
                 std::string t_title = apply_font_map(q.title, settings_.font_map);
-                content = pad_right(t_idx, 3) + settings_.list_separator + " " + t_title;
-                is_row_playing = has_track_ && q.is_local && q.local_path == current_path_;
+                content = pad_right(t_idx, idx_w) + settings_.list_separator + " "
+                        + pad_right(truncate_str(t_title, title_w), title_w);
+                if (artist_w > 0) {
+                    std::string t_artist = apply_font_map(q.artist, settings_.font_map);
+                    content += settings_.list_separator + " "
+                             + pad_right(truncate_str(t_artist, artist_w), artist_w);
+                }
+                // Was local-only: a queue of Spotify tracks gave no "you are
+                // here" at all, which is the common case for a queue built
+                // out of "sp:" searches.
+                is_row_playing = queue_item_is_current(q);
                 is_row_hovering = queue_focus_ && (idx == queue_selected_);
             }
             std::string padded = pad_right(truncate_str(content, inner), inner);
@@ -3438,7 +3565,12 @@ std::vector<std::string> App::build_queue_panel(int total_width, int height) con
         }
     }
 
-    out.push_back(box_bottom(total_width, "", border_ansi_bottom));
+    // The same "( N more )" affordance the list panel has: with a queue longer
+    // than the panel there was previously nothing on screen saying so.
+    std::string footer;
+    const int remaining = static_cast<int>(queue_.size()) - (queue_scroll_ + height);
+    if (remaining > 0) footer = "( " + std::to_string(remaining) + " more )";
+    out.push_back(box_bottom(total_width, footer, border_ansi_bottom));
     return out;
 }
 
@@ -3744,6 +3876,7 @@ void App::build_cheatsheet_screen(std::ostringstream& frame, int W) const {
     static const std::pair<const char*, const char*> rows[] = {
         {"HKeySearch",                      "Search local folder"},
         {"HKeySearchOnline",                "Search online (YouTube)"},
+        {"HKeySearchSpotify",               "Search Spotify"},
         {"HKeyDownloadStream",              "Download stream to 1st local path"},
         {"HKeyTogglePlayPause",             "Play / pause"},
         {"HKeyPlayNextSong",                "Play next in list/queue"},
@@ -3758,6 +3891,7 @@ void App::build_cheatsheet_screen(std::ostringstream& frame, int W) const {
         {"HKeySwitchBetweenCards",          "Switch between panels"},
         {"HKeyAddHoveringSongToQueue",      "Add hovering track to queue"},
         {"HKeyRemoveHoveringSongFromQueue", "Remove hovering track from queue"},
+        {"HKeyBulkAddPlaylist",             "Queue a whole YouTube playlist"},
         {"HKeyFilterForFolder",             "Filter by folder"},
         {"HKeyClearFilter",                 "Clear filter"},
         {"HKeyQuit",                        "Quit"},

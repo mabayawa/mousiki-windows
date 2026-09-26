@@ -79,6 +79,12 @@ private:
     ListSource pre_search_list_source_ = ListSource::Local;
     std::string pre_search_local_query_;
     std::string last_online_query_;
+    // Which online source produced online_view_. Spotify and YouTube results
+    // share one type (OnlineResult), so without this the search bar labels a
+    // "sp:" search "SEARCH ONLINE" and echoes it back as "/s:<query>" -- which
+    // is not just cosmetically wrong, it hides the fact that "sp:" exists at
+    // all from the one screen that would otherwise teach it.
+    bool last_online_was_spotify_ = false;
     int local_sort_mode_ = 0; // 0=folder order, 1=title A-Z, 2=artist A-Z
     static constexpr int kListVisibleRows = 8; // the *maximum*/preferred list height when there's room for it
 
@@ -558,11 +564,36 @@ private:
     // so both respect the queue exactly the same way. Caller must check
     // !queue_.empty() first.
     void play_next_from_queue();
+    // Plays queue_[idx] and consumes it exactly the way play_next_from_queue()
+    // always has -- erased, or rotated to the back under Repeat Queue -- so
+    // "Enter on a queue row" and "auto-advance into the queue" cannot drift
+    // apart. The single consumption path; play_next_from_queue() picks an index
+    // and delegates here.
+    void play_queue_index(int idx);
+    // Reconstitutes a QueueItem back into the LocalTrack/OnlineResult the start
+    // paths take, and dispatches. Split out of play_next_from_queue() so
+    // play_queue_index() is the only place that knows about consumption.
+    void start_queue_item(const QueueItem& item);
+    // Is this queue row the track that's actually playing right now? Local
+    // items match on path, online ones on spotify_uri when they have one and
+    // video_id otherwise -- the same identity rule current_track_list_index()
+    // uses, and for the same reason: every Spotify row carries an empty
+    // video_id, so matching on that alone made them all match each other.
+    bool queue_item_is_current(const QueueItem& item) const;
+    // Is list row `idx` (of whichever view list_source_ is showing) already
+    // sitting in the queue? Drives the little marker in the list panel, which
+    // is what makes "collect tracks across several searches" legible -- a new
+    // search replaces the results, so without it there's no way to see what
+    // you already took from the previous one.
+    bool list_row_in_queue(int idx) const;
     // Single letter for the mode-indicator button after the search bar:
     // L=list, R=repeat, S=shuffle, Q=repeat queue, O=stop (play-and-stop
     // -- not "S", that's shuffle's letter already).
     char play_mode_letter() const;
-    void queue_add_selected();
+    // Returns the title of the track it queued, or "" if there was nothing
+    // hovering to add -- so the caller can name it in the status line instead
+    // of reporting a bare "added to queue" that might not have happened.
+    std::string queue_add_selected();
     void queue_remove_last();
     void queue_remove_hovering();
     void queue_move_hovering(int dir); // dir=-1 up, +1 down

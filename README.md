@@ -94,7 +94,8 @@ Configurable in `%USERPROFILE%\.config\mousiki\config.txt`.
 | Action | Keybinding | Description |
 | :--- | :--- | :--- |
 | **Local Search** | `/` | Filter and search local library |
-| **Online Stream Search** | `/s: <query>` | Search and stream music online |
+| **Online Stream Search** | `/s: <query>` | Search and stream music online (YouTube) |
+| **Spotify Search** | `/sp: <query>` | Search Spotify (needs `SpotifyClientId`) |
 | **Download Stream** | `y` | Download currently streaming track |
 | **Play / Pause** | `p` (or `ENTER`) | Toggle playback |
 | **Next / Previous Track** | `n` / `b` | Skip between songs |
@@ -105,13 +106,22 @@ Configurable in `%USERPROFILE%\.config\mousiki\config.txt`.
 ### Navigation & Queue
 | Action | Keybinding | Description |
 | :--- | :--- | :--- |
-| **Navigate** | `ARROW_UP` / `ARROW_DOWN` | Move selection |
-| **Switch Tabs/Cards** | `TAB` | Cycle between UI panels |
-| **Add to Queue** | `a` | Enqueue selected track |
-| **Remove from Queue** | `d` | Dequeue selected track |
+| **Navigate** | `ARROW_UP` / `ARROW_DOWN` | Move selection (in whichever panel has focus) |
+| **Switch Tabs/Cards** | `TAB` | Move focus between the list and the queue |
+| **Add to Queue** | `a` | Enqueue the track hovered in the list — works from either panel |
+| **Remove from Queue** | `d` | Drop the hovered queue item |
+| **Play a Queue Item** | `ENTER` | With the queue focused, plays that item instead of the list row |
+| **Reorder Queue** | `u` / `ARROW_LEFT` | Move the hovered queue item up / down (queue focused) |
+| **Queue a Playlist** | `g` | Paste a YouTube playlist link and queue all of it |
 | **Filter by Folder** | `f` | Apply folder filter |
 | **Clear Filter** | `c` | Reset active search/filters |
 | **Quit** | `q` | Exit application |
+
+The queue is yours, not a view of the search results: a new `/s:` or `/sp:`
+search replaces the result list but leaves the queue alone, so you can search
+several times over and collect a track from each. A `•` beside a result row
+means that track is already in the queue. The queue also survives a restart —
+see `snapshot.json` under Configuration below.
 
 ## ⚙️ Configuration
 
