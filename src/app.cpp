@@ -3507,15 +3507,20 @@ std::vector<std::string> App::build_queue_panel(int total_width, int height) con
     out.push_back(box_top(title, total_width, border_ansi));
 
     if (queue_.empty()) {
-        int mid_row = height / 2;
+        // Two lines, because the second one is the part that was missing: this
+        // is the panel a person stares at while wondering how to fill it, and
+        // it never said which key does it.
+        //
+        // Centered as a BLOCK rather than "middle row, then the row after": the
+        // panel gets list_visible_rows_, which is only 2 on a 30-row terminal,
+        // so mid_row + 1 fell off the bottom -- dropping precisely the line
+        // that names the key.
+        const int block_top = std::max(0, (height - 2) / 2);
         for (int row = 0; row < height; ++row) {
             std::string content;
-            // Two lines, because the second one is the part that was
-            // missing: this is the panel a person stares at while wondering
-            // how to fill it, and it never said which key does it.
-            if (row == mid_row || row == mid_row + 1) {
-                const char* raw = (row == mid_row) ? "ADD TRACKS TO QUEUE"
-                                                   : "[a] add the hovered track";
+            if (row == block_top || row == block_top + 1) {
+                const char* raw = (row == block_top) ? "ADD TRACKS TO QUEUE"
+                                                     : "[a] add the hovered track";
                 std::string text = apply_font_map(raw, settings_.font_map);
                 int left = std::max(0, (inner - display_width(text)) / 2);
                 content = std::string(left, ' ') + text;
@@ -4392,25 +4397,49 @@ std::string App::render_frame(TerminalIO& term) {
     // writes -- whichever content lands on a given screen cell last in
     // the stream wins, and the panel is emitted after, so it draws over
     // the background wherever they overlap without needing a clear.
-    if (mode_ == Mode::BulkAdd) {
-        draw_floating_panel(frame, build_bulk_add_panel(), kBulkAddPanelWidth, W);
-    } else if (mode_ == Mode::RetryLyrics) {
-        draw_floating_panel(frame, build_retry_lyrics_panel(), kRetryLyricsPanelWidth, W);
-    }
-
     // Hard safety net on top of the list_visible_rows_ sizing above: even
     // if the fixed chrome alone (metadata+progress+search bar) is taller
     // than the terminal -- a case list_visible_rows_ can't do anything
     // about, since it only controls the list panel -- this guarantees
     // the actual byte stream handed to the terminal never contains more
     // rows than the terminal has, so it structurally cannot scroll no
-    // matter what future panels/config combinations produce. Only
-    // applied to the background portion's line count implicitly (the
-    // floating panel's absolute-positioned writes come after and are
-    // already bounds-checked by draw_floating_panel() itself, so
+    // matter what future panels/config combinations produce.
+    //
+    // Applies to the background only; the floating panel is stamped after it,
+    // for the reason spelled out below. The old note here claimed the ordering
+    // was safe because the panel adds no newlines of its own -- true, and
     // clamping here by counting trailing '\n's is still correct -- the
-    // panel's writes don't add any that would trip this).
-    return clamp_output_rows(frame.str(), term_rows_);
+    // beside the point: clamp_output_rows() does not count the panel's
+    // newlines, it TRUNCATES the whole string at the background's Nth newline
+    // and throws away everything after it, escape sequences included.
+    std::string out = clamp_output_rows(frame.str(), term_rows_);
+
+    // Bulk Add / Retry Lyrics: stamp their floating panel on top of the
+    // still-live background just built above, rather than replacing it. Uses
+    // absolute positioning (draw_floating_panel()), appended after the
+    // background's own sequential top-to-bottom writes -- whichever content
+    // lands on a given screen cell last in the stream wins, and the panel is
+    // emitted after, so it draws over the background wherever they overlap
+    // without needing a clear.
+    //
+    // Stamped AFTER the clamp, and that order is load-bearing: see above. With
+    // it the other way round, any terminal whose height the background alone
+    // fills -- 120x30 does -- had the panel silently truncated away, so it
+    // never appeared at all. And because Mode::BulkAdd swallows every key but
+    // ESC and typing, pressing its key then just made the app look frozen.
+    // Clamping first keeps the anti-scroll guarantee intact: the panel really
+    // does add no newlines, and draw_floating_panel() bounds its own start row
+    // to term_rows_ - panel_h.
+    if (mode_ == Mode::BulkAdd) {
+        std::ostringstream panel;
+        draw_floating_panel(panel, build_bulk_add_panel(), kBulkAddPanelWidth, W);
+        out += panel.str();
+    } else if (mode_ == Mode::RetryLyrics) {
+        std::ostringstream panel;
+        draw_floating_panel(panel, build_retry_lyrics_panel(), kRetryLyricsPanelWidth, W);
+        out += panel.str();
+    }
+    return out;
 }
 
 // Keeps at most (term_rows - 1) lines of `frame` (the -1 leaves the
