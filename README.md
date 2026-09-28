@@ -23,6 +23,7 @@ A native Windows port of [itzender5820/mousiki](https://github.com/itzender5820/
 - **Synced Lyrics:** Real-time, word-by-word active lyrics highlighting as the song plays.
 - **Visualizers:** Real-time FFT spectrum, waveform rendering, and spinning disk art.
 - **Queue Management:** Effortless queueing, shuffling, and repeating.
+- **Your Spotify Library:** Browse your own playlists, the ones you follow and your saved albums with `o`, and queue a track or a whole playlist from there.
 - **Highly Configurable:** Tweak colors, visualizer fluidity, animations, and hotkeys.
 
 ## 🚀 Getting Started
@@ -123,6 +124,50 @@ several times over and collect a track from each. A `•` beside a result row
 means that track is already in the queue. The queue also survives a restart —
 see `snapshot.json` under Configuration below.
 
+### Spotify Library
+
+Press `o` for a full-screen browser over your own Spotify library: the playlists
+you created, the ones you follow, and your saved albums. The library pane is on
+the left, the tracks of whichever row the cursor is on are on the right.
+
+| Action | Keybinding | Description |
+| :--- | :--- | :--- |
+| **Open / close** | `o` | Opens the browser; pressing it again closes it, as `t` does for the console |
+| **Switch pane** | `TAB` / `ARROW_LEFT` / `ARROW_RIGHT` | Move focus between the library and its tracks |
+| **Navigate** | `ARROW_UP` / `ARROW_DOWN` | Move the cursor in whichever pane has focus |
+| **Filter** | `/` | Filter the library by name or owner as you type; `ENTER` keeps it, `ESC` abandons it |
+| **Queue everything** | `a` | Queue every track in the selected playlist or album |
+| **Queue one track** | `ENTER` | With the tracks pane focused, queue the hovered track. From the library pane it jumps to the tracks instead |
+| **Clear filter** | `c` | Drop an active filter without leaving the browser |
+| **Reload** | `r` | Refetch from Spotify, bypassing the session cache |
+| **Close** | `ESC` | Clears an active filter first, then closes on the second press |
+
+`♫` marks a playlist, `▤` a saved album, and `•` a track already in your queue.
+Playlists you created are listed first, then the ones you follow, then your
+albums — in the order Spotify returns them within each group, since that is the
+order you arranged them in. "Mine" is decided by comparing Spotify user **ids**,
+not display names: a display name is neither unique nor guaranteed to exist, so
+a playlist made by someone sharing yours would otherwise be listed as your own.
+
+Queueing is instant however large the playlist. mousiki's queue is local, and
+Spotify's own queue endpoint is used only for a one-track gapless lookahead, so
+a 300-track album costs no extra network calls — the only wait is fetching the
+track list itself, which happens on a background thread.
+
+The library is fetched once per session and then cached in memory; `r` forces a
+refetch. Moving the cursor does not fetch anything until it has been still for a
+moment, so holding `ARROW_DOWN` through a large library costs one request rather
+than one per row. Nothing is written to disk.
+
+A playlist can show a track count larger than the list beneath it. Spotify counts
+local files in that total and mousiki cannot stream them, so they are dropped and
+the pane says how many were skipped. Below 72 columns only the focused pane is
+drawn, at full width, and `TAB` switches between the two views instead.
+
+Needs `SpotifyClientId` in `config.txt`, the same as `/sp:` search — see
+Configuration below. No extra permissions: the scopes this uses are already
+requested by the existing login.
+
 ## ⚙️ Configuration
 
 | | |
@@ -220,6 +265,14 @@ you searched for:
 | `lyrics-api.boidu.dev` | song title, artist |
 | `lrclib.net` | song title, artist |
 | `youtube.com` (search + yt-dlp) | your search query |
+| `accounts.spotify.com` | only when you use Spotify: the PKCE login, and token refreshes |
+| `api.spotify.com` | only when you use Spotify: your search query, and — for `o` — a read of your own profile, playlists, saved albums and their track lists |
+
+The Spotify reads are exactly that: reads. Nothing is written to your Spotify
+account, no playlist is created or modified, and the queue you build lives only
+in mousiki. The only write the app ever makes is to the playback transport of a
+device you already own (play, pause, seek, next), and the one-track lookahead
+that makes the handover gapless.
 
 No telemetry, no analytics, no phone-home, no credential or environment
 harvesting. Files are written only under `%USERPROFILE%\.config\mousiki`,
@@ -240,6 +293,10 @@ are byte-identical to upstream miniaudio v0.11.25 and kissfft.
   CJK are correct.
 - **The library is scanned once at startup** — inherited from upstream. Add music
   and restart.
+- **Opening the Spotify browser takes a second or two.** `o` runs three separate
+  helper invocations (profile, playlists, saved albums), each a Python start plus
+  a TLS handshake. It is fetched once per session and cached after that; `r`
+  refetches deliberately.
 - **ARM64 is untested.** The build targets x64.
 
 ## 🙏 Attribution
