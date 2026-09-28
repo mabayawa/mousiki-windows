@@ -138,6 +138,11 @@ public:
     // the only way for the user to get to the prompt.
     std::string auth_url() const;
     bool resync_pending() const { return resync_.load(std::memory_order_acquire); }
+    // How the last drain ended: true if the stream genuinely went quiet, false
+    // if it hit the 2 s cap while bytes were still arriving -- i.e. the pause
+    // the caller was relying on never took effect. Only meaningful once
+    // resync_pending() has gone false.
+    bool last_resync_quiet() const { return resync_quiet_.load(std::memory_order_acquire); }
 
     double seconds_since_last_byte() const;
 
@@ -159,6 +164,7 @@ private:
     std::atomic<bool> quit_{false};
     std::atomic<bool> reader_paused_{false};
     std::atomic<bool> resync_{false};
+    std::atomic<bool> resync_quiet_{true};
     std::atomic<State> state_{State::Idle};
     std::atomic<long long> written_cur_{0};
     // Bumped by reset_plan(). The reader snapshots it with the plan, so a read

@@ -305,7 +305,9 @@ void LibrespotSession::reader_main() {
             const long long deadline = now_ms() + 2000;
             long long last_data = now_ms();
             long long dropped = 0;
-            while (now_ms() < deadline && now_ms() - last_data < 250) {
+            bool went_quiet = false;
+            while (now_ms() < deadline) {
+                if (now_ms() - last_data >= 250) { went_quiet = true; break; }
                 const long long avail = proc->bytes_available();
                 if (avail < 0) break;
                 if (avail == 0) {
@@ -347,6 +349,13 @@ void LibrespotSession::reader_main() {
             const size_t orphaned = carry_len + static_cast<size_t>(dropped);
             carry_len = 0;
             skip_bytes = (kFrameBytes - (orphaned % kFrameBytes)) % kFrameBytes;
+            // Which way this ended matters to the caller. Quiet means the stream
+            // really did stop, so whatever arrives next belongs to what was asked
+            // for after the drain. The 2 s cap means it never stopped -- the pause
+            // did not take effect -- and the next bytes may still be the outgoing
+            // track's. Published BEFORE resync_ is cleared, since resync_ going
+            // down is the signal the caller waits on.
+            resync_quiet_.store(went_quiet, std::memory_order_release);
             resync_.store(false, std::memory_order_release);
             continue;
         }
@@ -366,11 +375,51 @@ void LibrespotSession::reader_main() {
         // drained faster than it fills and librespot never blocks.
         if (!ring->wait_for_room(kReadBytes / sizeof(float), abort)) continue;
 
+        // A bounded availability poll BEFORE the blocking read, so that quit,
+        // reader_paused_ and resync_ are observed within ~10 ms rather than
+        // "whenever the next byte happens to arrive".
+        //
+        // This used to be harmless: nothing waited on the drain, so a reader
+        // parked inside read_stdout simply woke late. App now stages a track
+        // switch as pause -> WAIT for the drain -> install the new plan, and the
+        // whole point of the wait is that Spotify has been paused -- so there may
+        // be no next byte at all. Usually the flags are set while bytes are still
+        // flowing (the pause has only been queued at that point, so the read
+        // returns within milliseconds) and this changes nothing; the case it
+        // fixes is a stream that had already gone quiet on its own, for instance
+        // because the user paused from their phone.
+        //
+        // Bounded, and then the blocking read happens anyway, because
+        // bytes_available() cannot portably tell a quiet pipe from a closed one:
+        // PeekNamedPipe reports a broken pipe as an error, but ioctl(FIONREAD)
+        // on POSIX just reports 0 bytes. Only read_stdout() returning 0
+        // distinguishes them on every platform, and losing that would mean a
+        // librespot that died mid-track was never noticed on the Linux build.
+        // The residual case -- a stream that goes quiet later than this window
+        // and a switch after that -- is covered by App's own drain timeout.
+        //
+        // None of this weakens the rate limiter: wait_for_room() above is still
+        // what applies backpressure, and the sleep below only runs when the pipe
+        // is empty, which is precisely when there is nothing to pace.
+        {
+            const long long poll_until = now_ms() + 2000;
+            long long avail = proc->bytes_available();
+            while (avail == 0 && !abort() && now_ms() < poll_until) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                avail = proc->bytes_available();
+            }
+            if (avail < 0) { state_.store(State::Dead, std::memory_order_release); return; }
+            // A pause/resync/quit landed while we waited: go round and act on it
+            // rather than reading bytes that belong to a plan on its way out.
+            if (avail == 0 && abort()) continue;
+        }
+
         const long long n = proc->read_stdout(buf.data(), buf.size());
         if (n < 0) { state_.store(State::Dead, std::memory_order_release); return; }
         if (n == 0) {
-            // Broken pipe: the process is gone. This is the ONLY end-of-stream
-            // condition -- a paused Spotify just blocks the read above.
+            // Broken pipe: the process is gone. This is STILL the ONLY
+            // end-of-stream condition -- a paused Spotify just blocks the read
+            // above, exactly as before.
             state_.store(State::Dead, std::memory_order_release);
             std::lock_guard<std::mutex> lk(mu_);
             if (error_.empty()) error_ = "librespot: process exited unexpectedly";

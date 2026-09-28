@@ -153,6 +153,69 @@ private:
     mutable std::chrono::steady_clock::time_point lyrics_status_shown_at_;
     mutable double viz_dt_ = 0.08;
 
+    // --- a track switch that has not become audible yet -------------------
+    //
+    // The UI used to become the new track at the KEYPRESS. On the Spotify paths
+    // the new track's audio does not START at the keypress -- it starts one or
+    // two HTTPS round trips later (Connect), or once librespot's pipe carries
+    // the new stream (librespot). So the progress clock restarted at 0:00, the
+    // new lyrics scrolled, and the old song was still coming out of the
+    // speakers. The UI was describing a future.
+    //
+    // Now everything that makes the UI "become" the new track is held here
+    // until a per-source predicate says that track's audio is genuinely
+    // playing, and then applied in one shot by commit_pending_track(). Until
+    // then has_track_ stays false, which is ALREADY exactly the neutral panel
+    // we want: no title, no lyrics, no visualizer, a still progress bar, and no
+    // auto-advance. That is why this costs one placeholder string rather than a
+    // render rework.
+    //
+    // adopt_prefetched_spotify() is the precedent -- it has always refused to
+    // touch the UI until boundary_seq() said the reader had really begun
+    // filling the next ring.
+    enum class TrackSource { Local, Youtube, Librespot, Remote };
+    struct PendingTrack {
+        bool valid = false;
+        TrackSource src = TrackSource::Local;
+        bool is_local = true;
+        fs::path path;
+        std::string video_id;
+        std::string spotify_uri;
+        TrackMetadata metadata;
+        size_t total_sec = 0;
+        // launch_lyrics_fetch()'s three arguments, captured verbatim at arm
+        // time: the fetch is keyed only on (title, artist), so they must not be
+        // re-derived at commit time from fields that may have moved on.
+        std::string lyrics_title, lyrics_artist;
+        fs::path lyrics_path;
+        // The absolute ring frame this stream begins at, so "has new PCM
+        // arrived" is "> origin" rather than "> 0" -- which keeps it correct for
+        // a snapshot resumed mid-track and for a post-seek origin.
+        long long origin_frames = 0;
+        // Remote only: set by poll_spotify() once /me/player reports this uri
+        // playing, with the position it reported.
+        bool remote_confirmed = false;
+        double confirmed_pos_sec = 0.0;
+        std::string label;           // the title, for the loading line
+        double timeout_sec = 6.0;
+        std::chrono::steady_clock::time_point armed_at{};
+    };
+    PendingTrack pending_track_;
+    // True from begin_track_switch() until commit_pending_track() or
+    // abort_pending_track(). Main thread only, like every other field in this
+    // view model -- no atomic, and nothing on the render path takes a lock for
+    // it.
+    bool switch_in_flight_ = false;
+    SpotifyControl::Ticket switch_pause_ticket_ = 0;
+    SpotifyControl::Ticket switch_play_ticket_ = 0;   // remote: gates eager state polling
+
+    void arm_pending_track(PendingTrack pt);
+    bool pending_track_audible() const;
+    void commit_pending_track();
+    void abort_pending_track(const std::string& why);
+    void poll_pending_commit();
+    std::string switch_status_text() const;
+
     // --- lyrics (background-fetched) ---
     mutable std::mutex lyrics_mutex_;
     mutable LyricsResult lyrics_result_;
@@ -433,11 +496,48 @@ private:
     std::chrono::steady_clock::time_point librespot_wait_start_{};
     bool librespot_said_auth_ = false;    // the one-time browser notice
 
+    // --- staged librespot start -------------------------------------------
+    //
+    // Starting a librespot track is four steps that MUST be separated in time,
+    // and the old code did all four in microseconds:
+    //
+    //   1. pause Spotify                    (a 200-600 ms HTTPS round trip)
+    //   2. drain the pipe of the old track  (only valid once 1 has LANDED)
+    //   3. install the new plan, unpause the reader
+    //   4. tell Spotify to play the new uri
+    //
+    // Firing 2 while 1 was merely QUEUED meant the drain was racing a stream
+    // that was still being written: it never saw its 250 ms of quiet, hit its
+    // 2 s cap, cleared resync_, and the reader then wrote the OUTGOING track's
+    // PCM into the INCOMING track's ring starting at frame 0. That is what the
+    // user heard -- not the old track still playing, but the old track being
+    // replayed as the new one, under the new one's clock and lyrics.
+    //
+    // Modelled on the pending_librespot_play_ deferral just above, which
+    // already defers a start by a Web API round trip.
+    enum class LsStage { None, AwaitPause, AwaitDrain };
+    LsStage ls_stage_ = LsStage::None;
+    OnlineResult ls_track_;
+    double ls_start_sec_ = 0.0;
+    // A seek is the same four steps for the SAME track: no UI identity to
+    // commit, and the audio device must keep running rather than be re-inited.
+    bool ls_is_seek_ = false;
+    SpotifyControl::Ticket ls_pause_ticket_ = 0;
+    std::chrono::steady_clock::time_point ls_stage_at_{};
+    bool ls_warned_slow_ = false;
+    static constexpr double kLsPauseWaitSec = 2.0;
+    static constexpr double kLsDrainWaitSec = 6.0;
+    void ls_advance_stage();
+    void ls_install_plan_and_play();
+
     fs::path resolve_librespot();
     bool start_spotify_librespot(const OnlineResult& r);
     bool launch_librespot_track(const OnlineResult& r, double start_sec);
     void poll_librespot();
-    void stop_spotify_audio();
+    // Returns the ticket of the pause it issued, or 0 when there was nothing to
+    // pause. The caller needs it: on the librespot path the resync drain is only
+    // meaningful once this specific pause has actually landed.
+    SpotifyControl::Ticket stop_spotify_audio();
 
     // --- gapless prefetch -------------------------------------------------
     // The next track handed to Spotify before the current one ends, so the byte

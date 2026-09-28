@@ -667,6 +667,27 @@ void App::reset_per_track_ui_state() {
 }
 
 void App::begin_track_switch() {
+    // 0. The UI stops describing ANY track as of now. It does not become the
+    //    incoming one here -- that is commit_pending_track(), once the incoming
+    //    track's audio is genuinely playing. has_track_ == false is already the
+    //    whole neutral loading panel: no title, no lyrics, no visualizer, a
+    //    still progress bar, no auto-advance, and every has_track_-gated key
+    //    (seek, play/pause) no-ops on its own.
+    has_track_ = false;
+    // Set from the KEYPRESS, not from arm_pending_track(). On the online path the
+    // target is not known until the resolve completes seconds later, and in
+    // between a switch is unambiguously in flight: the panel should say so, and
+    // every guard keyed on this flag (the waveform poller, the Spotify prefetch)
+    // applies for that whole window too. Every begin_track_switch() is followed
+    // by either an arm or an abort, so this cannot be left set.
+    switch_in_flight_ = true;
+    // A target armed by an earlier switch is superseded; the caller re-arms.
+    // Same for a staged librespot start -- abandoning it here is what makes a
+    // second keypress mid-switch correct rather than a race between two
+    // stagings.
+    pending_track_ = PendingTrack{};
+    ls_stage_ = LsStage::None;
+
     // 1. Cut the audio and the clock together, before anything that can take
     //    time. Lock-free and device-untouching -- see the comment on
     //    Player::begin_track_switch() for why this is not stop().
@@ -677,7 +698,12 @@ void App::begin_track_switch() {
     //    to be two bare flag clears in poll_pending_load(), which stopped
     //    mousiki DISPLAYING a Connect track while the Connect device carried
     //    on playing it.
-    stop_spotify_audio();
+    //
+    //    Keep the ticket: the librespot staging in ls_advance_stage() is only
+    //    correct once THIS pause has actually landed, and that is the only way
+    //    to know.
+    switch_pause_ticket_ = stop_spotify_audio();
+    switch_play_ticket_ = 0;
 
     // 3. Kill the outgoing decoder here rather than at load completion, so its
     //    ffmpeg child dies at the keypress instead of running alongside the
@@ -689,10 +715,147 @@ void App::begin_track_switch() {
     prefetch_valid_ = false;
     prefetch_session_.reset();
 
+    // Still here, and still at the keypress. Nothing of the outgoing track is on
+    // screen any more (has_track_ is false), so clearing the waveform and the
+    // spectrum costs nothing -- and the lyrics_epoch_ bump is load-bearing: it
+    // is what stops a lyrics fetch still in flight for the OUTGOING track from
+    // landing later and being drawn against whatever ends up playing.
     reset_per_track_ui_state();
 
     ConsoleLog::instance().log_verbose(
         "audio: track switch -- cut at " + std::to_string(cut_at) + "s, clock zeroed");
+}
+
+// ---------------------------------------------------------------------
+// Deferred UI commit: the new track exists on screen only once it is audible
+// ---------------------------------------------------------------------
+
+void App::arm_pending_track(PendingTrack pt) {
+    pt.valid = true;
+    // Measured from ARM, not from the start of the switch: an online resolve
+    // legitimately takes seconds and the neutral panel is the honest display for
+    // all of it. What has to be bounded is only the window between "we have
+    // asked for this track" and "we can hear it".
+    pt.armed_at = std::chrono::steady_clock::now();
+    pending_track_ = std::move(pt);
+    switch_in_flight_ = true;
+    status_line_ = switch_status_text();
+}
+
+std::string App::switch_status_text() const {
+    if (pending_track_.valid && !pending_track_.label.empty()) {
+        return "starting \"" + pending_track_.label + "\" ...";
+    }
+    // Nothing armed yet: the switch has begun but the incoming track is still
+    // being resolved, so there is no name to give.
+    return "loading ...";
+}
+
+// The one moment the UI becomes the new track.
+void App::commit_pending_track() {
+    // By value, and cleared first: reset_per_track_ui_state() and
+    // launch_lyrics_fetch() below must not be able to read a member that a
+    // re-arm replaced underneath them.
+    const PendingTrack pt = pending_track_;
+    pending_track_ = PendingTrack{};
+    switch_in_flight_ = false;
+    switch_pause_ticket_ = 0;
+    switch_play_ticket_ = 0;
+
+    current_is_local_    = pt.is_local;
+    current_path_        = pt.path;
+    current_video_id_    = pt.video_id;
+    current_spotify_uri_ = pt.spotify_uri;
+    metadata_            = pt.metadata;
+    total_sec_           = pt.total_sec;
+    has_track_           = true;
+
+    // Only now: until this line the track on screen was nothing at all, and
+    // anything accumulated during the switch belongs to neither track.
+    reset_per_track_ui_state();
+
+    if (pt.src == TrackSource::Remote) {
+        // Seeded from the position Spotify itself reported when it confirmed the
+        // track, not from the moment we asked for it. That is what stops the
+        // interpolated remote clock starting at 0:00 a round trip early.
+        spotify_pos_base_ = pt.confirmed_pos_sec;
+        spotify_pos_at_   = std::chrono::steady_clock::now();
+        spotify_state_at_ = spotify_pos_at_;
+        spotify_remote_paused_ = false;
+    }
+
+    player_.clear_finished();
+    launch_lyrics_fetch(pt.lyrics_title, pt.lyrics_artist, pt.lyrics_path);
+    status_line_.clear();
+    ConsoleLog::instance().log_verbose(
+        "audio: UI committed to \"" + pt.label + "\" after " +
+        std::to_string(std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pt.armed_at).count()) + "s");
+}
+
+void App::abort_pending_track(const std::string& why) {
+    // There is no incoming track and the outgoing one is already silent, so
+    // there is nothing to hold the panel for. Holding it would be exactly the
+    // stale-UI failure this design exists to remove.
+    pending_track_ = PendingTrack{};
+    switch_in_flight_ = false;
+    switch_pause_ticket_ = 0;
+    switch_play_ticket_ = 0;
+    ls_stage_ = LsStage::None;
+    has_track_ = false;
+    reset_per_track_ui_state();
+    if (!why.empty()) status_line_ = why;
+}
+
+bool App::pending_track_audible() const {
+    const PendingTrack& pt = pending_track_;
+    if (!pt.valid) return false;
+    switch (pt.src) {
+        case TrackSource::Local:
+        case TrackSource::Youtube:
+            // All three conditions are necessary.
+            //   device_live() -- play() clears switching_ BEFORE ma_device_init,
+            //     so !is_switching() alone is also true for a play() that then
+            //     failed to open a device.
+            //   !is_switching() -- the incoming ring must actually be in its slot.
+            //   decoded frames past the origin -- the device can be up and the
+            //     cursor advancing while the callback still reads zero-filled
+            //     slots, and that is silence, not the new track.
+            return player_.device_live() && !player_.is_switching() && current_session_ &&
+                   current_session_->ring()->decoded_hi_frames() > pt.origin_frames;
+        case TrackSource::Librespot:
+            // frames_written_current() is tighter than asking the ring: the
+            // reader advances written_cur_ only for the CURRENT plan front and
+            // only for a read that was not superseded, and reset_plan() seeds it
+            // with the origin. So this is precisely "new-track PCM has been
+            // written into the new ring" -- and the staging in ls_advance_stage()
+            // is what guarantees that PCM cannot be the outgoing track's.
+            return player_.device_live() && !player_.is_switching() &&
+                   librespot_.frames_written_current() > pt.origin_frames;
+        case TrackSource::Remote:
+            // No PCM ever reaches us in this mode, so nothing local can tell us.
+            // Only Spotify can, via poll_spotify().
+            return pt.remote_confirmed;
+    }
+    return false;
+}
+
+void App::poll_pending_commit() {
+    if (!switch_in_flight_ || !pending_track_.valid) return;
+    if (pending_track_audible()) { commit_pending_track(); return; }
+
+    const double waited = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - pending_track_.armed_at).count();
+    if (waited > pending_track_.timeout_sec) {
+        // Commit anyway. A UI wedged forever on a track that is not playing is
+        // worse than one that is briefly optimistic, and every predicate above
+        // depends on something -- a device, a pipe, a Web API -- that can be
+        // legitimately slow rather than broken.
+        ConsoleLog::instance().log_verbose(
+            "audio: committing UI to \"" + pending_track_.label +
+            "\" unconfirmed after " + std::to_string(waited) + "s");
+        commit_pending_track();
+    }
 }
 
 void App::launch_load_async(fs::path local_path, std::string title, std::string artist,
@@ -842,6 +1005,9 @@ void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path pa
 // Absolute seek -- a primitive the app never had. Routes between a cursor
 // move inside what the ring still holds, and a producer restart at the target.
 void App::seek_to(double target_sec) {
+    // Also covers a switch in flight: has_track_ is false for the whole of one,
+    // and seeking then would move the incoming track to a position taken from
+    // the outgoing one's clock.
     if (!has_track_) return;
     if (spotify_remote_) {
         if (total_sec_ > 0) target_sec = std::clamp(target_sec, 0.0, static_cast<double>(total_sec_));
@@ -868,37 +1034,45 @@ void App::seek_to(double target_sec) {
 
     if (spotify_librespot_) {
         // Far seek. Nothing in the stream marks where a jump happened, so the
-        // bytes already in the pipe and the ring predate it and have to go.
-        // Pause first to bound how much more can arrive, ask the reader (the only
-        // thread that touches the pipe) to drain, then restart at the target with
-        // a fresh ring epoch at that absolute frame.
+        // bytes already in the pipe and the ring predate it and have to go: pause,
+        // drain, then restart at the target with a fresh ring epoch at that
+        // absolute frame.
         //
-        // Honest about the race: the Web API pause returns before librespot's
-        // player thread has necessarily stopped, so a fraction of a second of
-        // pre-seek audio can still land -- a blip at the seek point, which is the
-        // kind of artefact a seek is forgiven for. It cannot be eliminated
-        // without a delimited protocol.
+        // This is the same four steps as starting a track and it used to have the
+        // same defect -- the drain was fired while the pause was still queued, so
+        // it raced a live stream and pre-seek audio landed at the target frame as
+        // if it belonged there. So it goes through the same stage machine, which
+        // waits for the pause to actually land before draining. ls_is_seek_ is what
+        // tells stage 3 not to re-init the audio device: this is the same track,
+        // and there is no UI identity to commit either, so no PendingTrack is
+        // armed and begin_track_switch() is deliberately not called.
+        //
+        // The bar still responds to the keypress immediately, which is why the
+        // rebase and the reader pause stay here rather than moving into stage 3.
         player_.rebase_for_restart(target_sec);
         librespot_.set_reader_paused(true);
-        spotify_ctl_.pause(librespot_device_id_);
-        librespot_.request_resync();
 
         const long long origin = static_cast<long long>(target_sec * 44100.0);
         current_session_->ring()->begin_epoch(origin);
 
-        LibrespotTrack t;
-        t.uri = current_spotify_uri_;
-        t.frames_expected =
-            total_sec_ > 0 ? static_cast<long long>(static_cast<double>(total_sec_) * 44100.0) : 0;
-        t.origin_frames = origin;
-        t.session = current_session_;
-        librespot_.reset_plan(std::move(t));
-        librespot_.set_reader_paused(false);
-        // play-with-position rather than a bare seek: it forces a sink stop/start,
-        // a cleaner boundary than a mid-stream jump. It also REPLACES the context,
-        // so any prefetch queued behind this track is gone and must be re-issued.
-        spotify_ctl_.play(librespot_device_id_, {current_spotify_uri_},
-                          static_cast<long long>(target_sec * 1000.0));
+        // play-with-position REPLACES the Spotify context, so any prefetch queued
+        // behind this track is gone -- and reset_plan() in stage 3 drops its ring
+        // from the reader's plan too. The existing comment said so; nothing
+        // actually cleared it, which left prefetch_valid_ true against a plan
+        // entry that no longer exists, so the gapless handover could never fire
+        // again for this track.
+        prefetch_valid_ = false;
+        prefetch_session_.reset();
+
+        ls_track_ = OnlineResult{};
+        ls_track_.spotify_uri = current_spotify_uri_;
+        ls_track_.duration_sec = total_sec_ > 0 ? static_cast<double>(total_sec_) : 0.0;
+        ls_start_sec_ = target_sec;
+        ls_is_seek_ = true;
+        ls_pause_ticket_ = spotify_ctl_.pause_now(librespot_device_id_);
+        ls_stage_ = LsStage::AwaitPause;
+        ls_stage_at_ = std::chrono::steady_clock::now();
+        ls_warned_slow_ = false;
         return;
     }
 
@@ -928,36 +1102,41 @@ void App::poll_pending_load() {
     load_stage_ = 0;
 
     if (!pl.success) {
-        status_line_ = pl.error;
         // begin_track_switch() already ended the outgoing track when this load
         // started -- audio cut, decoder gone -- and there is no incoming track
         // to replace it. Saying otherwise would draw a now-playing panel for
         // silence, and would let the main loop's auto-advance run against it.
-        has_track_ = false;
+        abort_pending_track(pl.error);
         return;
     }
 
     // The outgoing track was already ended by begin_track_switch() when this
     // load started: audio cut, clock zeroed, decoder shut down, Spotify
     // transports paused, visualisers cleared. All that is left here is to
-    // adopt the track that just finished loading.
+    // adopt the track that just finished loading -- the TRANSPORT half now, the
+    // UI half once it is audible.
     current_session_ = pl.session;
-    total_sec_ = pl.total_sec;
-    metadata_ = pl.metadata;
-    current_path_ = pl.path;
-    current_is_local_ = pl.is_local;
-    current_video_id_ = pl.video_id;
-    current_spotify_uri_ = pl.spotify_uri;
-    has_track_ = true;
-    player_.clear_finished(); // see clear_finished()'s comment — closes the race that caused the double-skip bug
 
-    // The moment the UI becomes the new track. This must read 0.00s: anything
-    // else is the old track's position about to drive the new track's progress
-    // bar, timestamp and synced lyrics.
-    ConsoleLog::instance().log_verbose(
-        "audio: track handoff -- clock at " + std::to_string(player_.poll_elapsed()) + "s");
-
-    launch_lyrics_fetch(pl.title, pl.artist, pl.path);
+    PendingTrack pt;
+    pt.src = pl.is_local ? TrackSource::Local : TrackSource::Youtube;
+    pt.is_local = pl.is_local;
+    pt.path = pl.path;
+    pt.video_id = pl.video_id;
+    pt.spotify_uri = pl.spotify_uri;
+    pt.metadata = pl.metadata;
+    pt.total_sec = pl.total_sec;
+    pt.lyrics_title = pl.title;
+    pt.lyrics_artist = pl.artist;
+    pt.lyrics_path = pl.path;
+    // A restored snapshot resumes mid-track, so "new PCM has arrived" means
+    // "past the resume origin", not "past 0". Read BEFORE
+    // launch_device_play_async() below, which consumes and zeroes it.
+    pt.origin_frames = static_cast<long long>(resume_start_sec_ * 44100.0);
+    pt.label = pl.metadata.name.empty() ? pl.title : pl.metadata.name;
+    // The resolve is already done by this point, so this only has to cover
+    // device init plus the first decoded frames.
+    pt.timeout_sec = pl.is_local ? 2.0 : 3.0;
+    arm_pending_track(std::move(pt));
 
     // This is the whole point of the redesign: play() is handed a
     // PcmRing that may have zero frames decoded yet. The audio
@@ -966,7 +1145,6 @@ void App::poll_pending_load() {
     // moment decode produces its first chunk, not after the whole track.
     // Dispatched off the main thread — see launch_device_play_async().
     launch_device_play_async();
-    status_line_.clear();
 }
 
 void App::start_device_worker() {
@@ -1046,6 +1224,10 @@ void App::launch_device_play_async() {
 
 void App::poll_pending_waveform() {
     if (!current_session_) return;
+    // current_session_ already points at the INCOMING track's ring, but nothing
+    // of that track is on screen yet and commit_pending_track() clears the
+    // envelope anyway -- so this would only build something to throw away.
+    if (switch_in_flight_) return;
     const bool scan = current_session_->scan_complete();
     if (scan && waveform_scan_applied_) return;
     // While only the live (playback-rate) envelope exists, refresh a few times
@@ -1390,6 +1572,24 @@ SnapshotData App::build_snapshot() const {
         snap.now_playing.title = metadata_.name;
         snap.now_playing.artist = metadata_.artist;
         snap.position_sec = current_elapsed();
+    } else if (switch_in_flight_ && pending_track_.valid) {
+        // Quitting during a switch. has_track_ is false for its whole duration,
+        // so without this the snapshot would say "nothing was playing" and the
+        // next session would come up empty -- losing a resume point the user had
+        // until they pressed Enter. The track they asked for, at 0, is the honest
+        // answer: it is what they would expect to come back to.
+        snap.has_now_playing = true;
+        snap.now_playing.is_local = pending_track_.is_local;
+        snap.now_playing.path =
+            pending_track_.is_local ? path_utf8(pending_track_.path) : std::string();
+        snap.now_playing.video_id =
+            pending_track_.is_local ? std::string() : pending_track_.video_id;
+        snap.now_playing.spotify_uri =
+            pending_track_.is_local ? std::string() : pending_track_.spotify_uri;
+        snap.now_playing.duration_sec = static_cast<double>(pending_track_.total_sec);
+        snap.now_playing.title = pending_track_.metadata.name;
+        snap.now_playing.artist = pending_track_.metadata.artist;
+        snap.position_sec = 0.0;
     }
 
     for (const auto& item : queue_) {
@@ -1872,16 +2072,30 @@ fs::path App::resolve_librespot() {
 }
 
 // Tears down whichever Spotify transport is live, so two can never run at once.
-void App::stop_spotify_audio() {
+// Returns the ticket of the pause it issued, or 0 when there was nothing to
+// pause -- only one of the two transports can be live, which is the invariant
+// this function exists to enforce, so one ticket is always enough.
+SpotifyControl::Ticket App::stop_spotify_audio() {
+    SpotifyControl::Ticket t = 0;
+    // pause_now() rather than pause(): it jumps the queue and drops whatever
+    // play/queue/seek commands were still waiting on it. Those all describe the
+    // track the user has just moved away from, and each one is a round trip the
+    // pause would otherwise have had to wait behind -- which is what made
+    // "stops in 300 ms" read as "keeps playing for a few seconds".
     if (spotify_remote_ && !spotify_device_id_.empty()) {
-        spotify_ctl_.pause(spotify_device_id_);
+        t = spotify_ctl_.pause_now(spotify_device_id_);
     }
     if (spotify_librespot_) {
+        // Immediate and local: this stops us CONSUMING the pipe, which together
+        // with Player::begin_track_switch() silences our own device within one
+        // device period. The Web API pause below is about stopping the PRODUCER
+        // and about Spotify's own bookkeeping, not about what the user hears.
         librespot_.set_reader_paused(true);
-        if (!librespot_device_id_.empty()) spotify_ctl_.pause(librespot_device_id_);
+        if (!librespot_device_id_.empty()) t = spotify_ctl_.pause_now(librespot_device_id_);
     }
     spotify_remote_ = false;
     spotify_librespot_ = false;
+    return t;
 }
 
 bool App::start_spotify_librespot(const OnlineResult& r) {
@@ -1924,27 +2138,20 @@ bool App::start_spotify_librespot(const OnlineResult& r) {
     return true;   // deferred, not failed
 }
 
+// Stage 1 of four. See the LsStage comment in app.h for why this is staged at
+// all; ls_advance_stage() below runs stages 2-4 from the main loop.
 bool App::launch_librespot_track(const OnlineResult& r, double start_sec) {
     if (librespot_device_id_.empty()) return false;
 
-    // Whatever was playing stops first, local or remote.
+    // Whatever was playing stops first, local or remote. This also issues the
+    // priority pause whose ticket stage 2 waits on.
     begin_track_switch();
 
-    // The librespot child is ONE process for the whole session, so right now
-    // its stdout pipe can still hold up to 64 KiB of the PREVIOUS track's PCM.
-    // reset_plan() below only changes which session the reader writes into --
-    // without a resync those leftover bytes become the first samples of the
-    // new track's ring. The new song's clock then starts at 0 while its audio
-    // starts late by however much was buffered, and that offset never
-    // corrects: the timestamp and every lyric stay wrong by it for the whole
-    // song. seek_to() has always done this; this path never did.
-    // No spotify_ctl_.pause() here: begin_track_switch() -> stop_spotify_audio()
-    // already issued it, and only in the case where it does anything -- coming
-    // from a local track there is nothing playing on our device to pause, and
-    // the call would cost a Python subprocess and an HTTPS round trip to be
-    // told so.
+    // Immediate and idempotent: stops us consuming the pipe, so our own device
+    // is silent within one device period whatever Spotify does next. Unlike
+    // before, the reader now STAYS paused until stage 3 -- the whole bug was
+    // unpausing it while the outgoing track was still being written.
     librespot_.set_reader_paused(true);
-    librespot_.request_resync();
 
     const double dur = r.duration_sec > 0 ? r.duration_sec : 0.0;
     auto session = std::make_shared<DecodeSession>();
@@ -1955,39 +2162,167 @@ bool App::launch_librespot_track(const OnlineResult& r, double start_sec) {
     const long long origin = static_cast<long long>(std::max(0.0, start_sec) * 44100.0);
     if (origin > 0) session->ring()->begin_epoch(origin);
 
+    // The session exists from here so current_session_ is never null while a
+    // start is in flight -- the waveform poller, seek_to() and the snapshot all
+    // dereference it. Nothing feeds it until stage 3, and nothing DRAWS it until
+    // commit_pending_track().
+    current_session_ = session;
+    spotify_librespot_ = true;   // transport ownership: immediate, see app.h
+
+    ls_track_ = r;
+    ls_start_sec_ = start_sec;
+    ls_is_seek_ = false;
+    ls_pause_ticket_ = switch_pause_ticket_;
+    ls_stage_ = LsStage::AwaitPause;
+    ls_stage_at_ = std::chrono::steady_clock::now();
+    ls_warned_slow_ = false;
+
+    PendingTrack pt;
+    pt.src = TrackSource::Librespot;
+    pt.is_local = false;
+    pt.spotify_uri = r.spotify_uri;
+    pt.total_sec = dur > 0 ? static_cast<size_t>(dur) : 0;
+    pt.metadata = TrackMetadata{};
+    pt.metadata.name = r.title;
+    pt.metadata.artist = r.uploader;
+    pt.metadata.location = "spotify";
+    pt.lyrics_title = r.title;
+    pt.lyrics_artist = r.uploader;
+    pt.origin_frames = origin;
+    pt.label = r.title;
+    // Pause round trip, plus the drain, plus the play round trip, plus the first
+    // bytes down the pipe.
+    pt.timeout_sec = 8.0;
+    arm_pending_track(std::move(pt));
+
+    resume_start_sec_ = start_sec;
+    return true;   // deferred, not failed
+}
+
+// Stages 2-4. Polled once per frame from poll_librespot().
+void App::ls_advance_stage() {
+    if (ls_stage_ == LsStage::None) return;
+
+    // Taking this branch means poll_librespot() returned before its own
+    // dead-daemon check, so do it here: a librespot that died mid-staging would
+    // otherwise be noticed only when the commit timeout fired, and the UI would
+    // then commit to a track that can never produce a sample.
+    if (librespot_.state() == LibrespotSession::State::Dead ||
+        librespot_.state() == LibrespotSession::State::Failed) {
+        const std::string e = librespot_.last_error();
+        log_event(e.empty() ? std::string("librespot: stopped unexpectedly") : e);
+        librespot_.shutdown();
+        spotify_librespot_ = false;
+        ls_stage_ = LsStage::None;
+        // A seek arms nothing, so there is nothing to abort -- and the track it
+        // belongs to is gone with the daemon either way.
+        if (!ls_is_seek_) {
+            abort_pending_track("librespot stopped -- nothing is playing");
+            if (current_session_) { current_session_->shutdown(); current_session_.reset(); }
+        }
+        return;
+    }
+
+    const double waited = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - ls_stage_at_).count();
+
+    if (ls_stage_ == LsStage::AwaitPause) {
+        // Ticket 0 means nothing needed pausing -- we came from a local track, or
+        // from nothing -- so there is no outgoing Spotify stream to outrun.
+        const bool landed = spotify_ctl_.completed(ls_pause_ticket_);
+        if (!landed && waited < kLsPauseWaitSec) return;
+        if (!landed) {
+            // Proceed anyway rather than wedge a start on a slow or broken Web
+            // API. What is lost is the guarantee, not correctness: the drain's own
+            // 2 s cap still bounds it, skip_bytes still keeps the stream frame
+            // aligned, and plan_epoch_ still suppresses stale writes.
+            ConsoleLog::instance().log_verbose(
+                "spotify: pause did not confirm in " + std::to_string(kLsPauseWaitSec) +
+                "s -- draining anyway");
+        }
+        // NOW the drain's own assumption holds -- "the caller pauses Spotify
+        // before asking for this, so librespot is writing nothing". Firing it at
+        // the keypress, while the pause was merely queued, is what let the drain
+        // race a live stream and give up at its 2 s cap.
+        librespot_.request_resync();
+        ls_stage_ = LsStage::AwaitDrain;
+        ls_stage_at_ = std::chrono::steady_clock::now();
+        return;
+    }
+
+    // AwaitDrain. The reader clears resync_ only after the drain loop AND the
+    // skip_bytes computation, so this one flag is the whole "the pipe is clean
+    // and the stream is realigned" signal.
+    if (librespot_.resync_pending()) {
+        if (waited > 1.5 && !ls_warned_slow_) {
+            ls_warned_slow_ = true;
+            ConsoleLog::instance().log_verbose("spotify: waiting for the pipe to drain ...");
+        }
+        if (waited < kLsDrainWaitSec) return;
+        // Install anyway. With resync_ still set the reader will drain once more
+        // and eat the first fraction of the new track -- audibly a slightly late
+        // start, which beats a start that never happens.
+        log_event("librespot: pipe did not go quiet -- starting anyway");
+    } else if (!librespot_.last_resync_quiet()) {
+        // The drain ended on its 2 s cap with bytes still arriving, i.e. the
+        // pause never took effect. Worth saying: the "first PCM is necessarily
+        // the new track's" argument does not hold in this case, so the start may
+        // open with a fraction of a second of the outgoing track.
+        ConsoleLog::instance().log_verbose(
+            "librespot: drain hit its cap -- the stream never went quiet");
+    }
+    ls_install_plan_and_play();
+}
+
+// Stages 3 and 4, in that order and for that reason.
+void App::ls_install_plan_and_play() {
+    const double dur = ls_track_.duration_sec > 0 ? ls_track_.duration_sec : 0.0;
+    const long long origin = static_cast<long long>(std::max(0.0, ls_start_sec_) * 44100.0);
+
     LibrespotTrack t;
-    t.uri = r.spotify_uri;
+    t.uri = ls_track_.spotify_uri;
     t.frames_expected = dur > 0 ? static_cast<long long>(dur * 44100.0) : 0;
     t.origin_frames = origin;
-    t.session = session;
+    t.session = current_session_;
+
+    // ORDER, and it is all release/acquire pairing:
+    //  - reset_plan() publishes the plan under mu_, seeds written_cur_ with the
+    //    origin (release) and bumps plan_epoch_ (release). The reader loads
+    //    plan_epoch_ with acquire while holding that same mu_ at the top of every
+    //    iteration, so it can never see the new epoch with the old plan.
+    //  - set_reader_paused(false) is a release store the reader picks up with an
+    //    acquire load, and it happens AFTER the plan is published -- so the reader
+    //    cannot begin writing before the ring it must write into is visible to it.
+    //  - the play command goes out LAST, so its round trip begins only once the
+    //    reader is ready to consume what it produces. And because pause_now()
+    //    dropped every superseded Play/Queue/Resume/Seek/Next, it is the control
+    //    worker's next action rather than its fourth.
+    //
+    // The pipe was OBSERVED quiet before any of this, which is what makes the
+    // first bytes the reader writes into this ring necessarily post-play -- the
+    // new track's.
     librespot_.reset_plan(std::move(t));
     librespot_.set_reader_paused(false);
+    spotify_ctl_.play(librespot_device_id_, {ls_track_.spotify_uri},
+                      ls_start_sec_ > 0.0 ? static_cast<long long>(ls_start_sec_ * 1000.0) : -1);
 
-    current_session_ = session;
-    spotify_librespot_ = true;
-    has_track_ = true;
-    current_is_local_ = false;
-    current_video_id_.clear();
-    current_spotify_uri_ = r.spotify_uri;
-    current_path_.clear();
-    total_sec_ = dur > 0 ? static_cast<size_t>(dur) : 0;
-    metadata_ = TrackMetadata{};
-    metadata_.name = r.title;
-    metadata_.artist = r.uploader;
-    metadata_.location = "spotify";
     player_.clear_finished();
+    // A seek keeps its running device; re-initialising it would put a hole in the
+    // audio where the user asked for a jump, not a gap.
+    if (!ls_is_seek_) launch_device_play_async();
 
-    // Tell Spotify to play it on OUR device. One uri here; the prefetch appends
-    // the next one to Spotify's queue later, which is what makes it gapless.
-    spotify_ctl_.play(librespot_device_id_, {r.spotify_uri},
-                      start_sec > 0.0 ? static_cast<long long>(start_sec * 1000.0) : -1);
-    resume_start_sec_ = start_sec;
-    launch_device_play_async();
-    launch_lyrics_fetch(r.title, r.uploader, {});
-    return true;
+    ls_stage_ = LsStage::None;
+    // The UI still does not move. pending_track_audible() waits for
+    // frames_written_current() to pass origin_frames -- for the reader to have
+    // written real new-track PCM.
 }
 
 void App::poll_librespot() {
+    // A staged start owns the librespot transport until it completes. The
+    // device-registration wait below is a strictly earlier phase and the two
+    // cannot both be active -- that wait is what CALLS launch_librespot_track().
+    if (ls_stage_ != LsStage::None) { ls_advance_stage(); return; }
+
     if (!librespot_play_pending_) {
         // Notice a dead daemon even while idle, so the next play does not
         // silently do nothing.
@@ -2089,6 +2424,16 @@ bool App::peek_next_spotify(OnlineResult& out) const {
 // which is why that form is only usable at the very start.
 void App::maybe_prefetch_spotify() {
     if (!spotify_librespot_ || prefetch_valid_) return;
+    // total_sec_ and current_elapsed() still describe the OUTGOING track during
+    // a switch, so the "20 s from the end" test below can fire immediately -- and
+    // it would append to a plan that ls_install_plan_and_play() is about to reset.
+    if (switch_in_flight_) return;
+    // The same, for a staged SEEK: that one does not set switch_in_flight_ (same
+    // track, no UI identity to commit) but it does end in a reset_plan(), which
+    // drops the whole deque. A prefetch appended in between would leave
+    // prefetch_valid_ true against a plan entry that no longer exists, so the
+    // gapless handover could never fire again for this track.
+    if (ls_stage_ != LsStage::None) return;
     if (!settings_.spotify_prefetch) return;
     if (total_sec_ == 0 || librespot_device_id_.empty()) return;
     // Far enough ahead that the request and Spotify's own buffering land before
@@ -2120,6 +2465,12 @@ void App::maybe_prefetch_spotify() {
 // the prefetched track, take it over rather than starting anything.
 bool App::adopt_prefetched_spotify() {
     if (!spotify_librespot_ || !prefetch_valid_ || !prefetch_session_) return false;
+    // A switch is in flight, so the track this would adopt is not the one the
+    // user is waiting for. begin_track_switch() clears prefetch_valid_ and so
+    // this cannot fire mid-switch anyway -- the guard makes that structural
+    // rather than incidental.
+    if (switch_in_flight_) return false;
+
     // The reader only bumps this once it has actually begun filling the next
     // ring, so this is the signal that the handover really happened.
     if (librespot_.boundary_seq() == prefetch_boundary_) return false;
@@ -2223,27 +2574,34 @@ bool App::start_spotify_remote(const OnlineResult& r) {
         if (d.id == dev) { spotify_device_name_ = d.name; break; }
     }
 
-    has_track_ = true;
-    current_is_local_ = false;
-    current_video_id_.clear();
-    current_spotify_uri_ = r.spotify_uri;
-    current_path_.clear();
-    total_sec_ = r.duration_sec > 0 ? static_cast<size_t>(r.duration_sec) : 0;
-    metadata_ = TrackMetadata{};
-    metadata_.name = r.title;
-    metadata_.artist = r.uploader;
-    metadata_.location = "spotify";
-
-    spotify_pos_base_ = 0.0;
-    spotify_pos_at_ = std::chrono::steady_clock::now();
-    spotify_state_at_ = spotify_pos_at_;
+    // Identity, duration, lyrics and the position base are all DEFERRED to
+    // commit_pending_track(). The Connect device does not start the new track
+    // until the pause and then the play have each completed a round trip, and
+    // asserting any of this now is what put the new title and new lyrics on
+    // screen with the old song still audible.
+    PendingTrack pt;
+    pt.src = TrackSource::Remote;
+    pt.is_local = false;
+    pt.spotify_uri = r.spotify_uri;
+    pt.total_sec = r.duration_sec > 0 ? static_cast<size_t>(r.duration_sec) : 0;
+    pt.metadata = TrackMetadata{};
+    pt.metadata.name = r.title;
+    pt.metadata.artist = r.uploader;
+    pt.metadata.location = "spotify";
+    pt.lyrics_title = r.title;
+    pt.lyrics_artist = r.uploader;
+    pt.label = r.title;
+    // Two round trips (pause, then play) plus the confirming poll.
+    pt.timeout_sec = 8.0;
+    arm_pending_track(std::move(pt));
 
     // No PCM ever reaches us in this mode, so nothing can drive the
     // visualisers; begin_track_switch() already cleared them.
     player_.clear_finished();
 
-    spotify_ctl_.play(dev, {r.spotify_uri});
-    launch_lyrics_fetch(r.title, r.uploader, {});
+    // Kept: poll_spotify() only polls /me/player eagerly once this has landed,
+    // and that poll is the only thing that can confirm the switch.
+    switch_play_ticket_ = spotify_ctl_.play(dev, {r.spotify_uri});
     log_event("spotify: playing via " +
               (spotify_device_name_.empty() ? std::string("Spotify") : spotify_device_name_) +
               " -- visualizers unavailable in this mode");
@@ -2287,42 +2645,87 @@ void App::poll_spotify() {
     SpotifyPlaybackState st;
     if (spotify_ctl_.take_state(st)) {
         const auto now = std::chrono::steady_clock::now();
-        if (st.duration_ms > 0) total_sec_ = static_cast<size_t>(st.duration_ms / 1000);
 
-        // The user moved playback to another device (their phone, say). Yield
-        // rather than fight over it -- an account plays on one device at a time.
-        if (!st.device_id.empty() && st.device_id != spotify_device_id_) {
-            log_event("spotify: playback moved to " +
-                      (st.device_name.empty() ? std::string("another device") : st.device_name));
-            spotify_device_id_ = st.device_id;
-            spotify_device_name_ = st.device_name;
+        // A remote switch is waiting to be confirmed. This is the ONLY thing that
+        // can confirm it -- no PCM ever reaches us in this mode.
+        const bool awaiting_remote = switch_in_flight_ && pending_track_.valid &&
+                                     pending_track_.src == TrackSource::Remote;
+        if (awaiting_remote) {
+            if (st.playing && !st.uri.empty() && st.uri == pending_track_.spotify_uri) {
+                pending_track_.remote_confirmed = true;
+                pending_track_.confirmed_pos_sec = static_cast<double>(st.progress_ms) / 1000.0;
+                if (st.duration_ms > 0) {
+                    pending_track_.total_sec = static_cast<size_t>(st.duration_ms / 1000);
+                }
+            }
         }
 
-        // Track ended. With a single-uri play and repeat off, Spotify simply
-        // stops, so "not playing AND we were near the end" is the signal. A
-        // stall near the start is a buffering hiccup, not an ending.
-        const bool near_end = st.duration_ms > 0 && st.progress_ms >= st.duration_ms - 2000;
-        const bool changed = !st.uri.empty() && !current_spotify_uri_.empty() &&
-                             st.uri != current_spotify_uri_;
-        if ((!st.playing && near_end) || changed) {
-            advance_track();
-            return;
-        }
+        // Everything below acts on current_* and total_sec_, which still describe
+        // the OUTGOING track until the commit, so all of it has to be skipped
+        // while a remote switch is in flight:
+        //   - total_sec_ would be overwritten with the incoming duration under a
+        //     panel that is showing neither track;
+        //   - st.uri != current_spotify_uri_ reads as "the track changed" and
+        //     calls advance_track(), which would auto-skip the very track that is
+        //     starting;
+        //   - the position base would start the remote clock for a track that has
+        //     not been committed.
+        //
+        // Skipped, not returned from: the state re-request further down is what
+        // asks again, and a poll that did not confirm has to be followed by
+        // another one or the switch could only ever end in its timeout.
+        if (!awaiting_remote) {
 
-        spotify_remote_paused_ = !st.playing;
-        spotify_pos_base_ = static_cast<double>(st.progress_ms) / 1000.0;
-        spotify_pos_at_ = now;
+            if (st.duration_ms > 0) total_sec_ = static_cast<size_t>(st.duration_ms / 1000);
+
+            // The user moved playback to another device (their phone, say). Yield
+            // rather than fight over it -- an account plays on one device at a time.
+            if (!st.device_id.empty() && st.device_id != spotify_device_id_) {
+                log_event("spotify: playback moved to " +
+                          (st.device_name.empty() ? std::string("another device") : st.device_name));
+                spotify_device_id_ = st.device_id;
+                spotify_device_name_ = st.device_name;
+            }
+
+            // Track ended. With a single-uri play and repeat off, Spotify simply
+            // stops, so "not playing AND we were near the end" is the signal. A
+            // stall near the start is a buffering hiccup, not an ending.
+            const bool near_end = st.duration_ms > 0 && st.progress_ms >= st.duration_ms - 2000;
+            const bool changed = !st.uri.empty() && !current_spotify_uri_.empty() &&
+                                 st.uri != current_spotify_uri_;
+            if ((!st.playing && near_end) || changed) {
+                advance_track();
+                return;
+            }
+
+            spotify_remote_paused_ = !st.playing;
+            spotify_pos_base_ = static_cast<double>(st.progress_ms) / 1000.0;
+            spotify_pos_at_ = now;
+
+        }   // !awaiting_remote
     }
 
     const auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - spotify_state_at_).count() >= 2000) {
+    // Eager only while a remote switch is waiting for confirmation, and only
+    // once the play command has actually landed -- polling before that spends a
+    // Python subprocess asking a question the API cannot yet answer any
+    // differently. request_state() is coalesced, so at most one poll is ever in
+    // flight regardless; this interval bounds the subprocess RATE, not the queue.
+    const long long interval_ms =
+        (switch_in_flight_ && pending_track_.valid &&
+         pending_track_.src == TrackSource::Remote &&
+         spotify_ctl_.completed(switch_play_ticket_)) ? 400 : 2000;
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - spotify_state_at_).count() >= interval_ms) {
         spotify_state_at_ = now;
         spotify_ctl_.request_state();
     }
 
     // Belt and braces: if interpolation has run past the end and the poll has
     // not caught up yet, advance anyway rather than sit on a finished track.
-    if (!spotify_remote_paused_ && total_sec_ > 0 &&
+    // Skipped mid-switch: total_sec_ is the outgoing track's duration and the
+    // clock is not the incoming track's yet, so this would advance straight past
+    // the track that is starting.
+    if (!switch_in_flight_ && !spotify_remote_paused_ && total_sec_ > 0 &&
         current_elapsed() >= static_cast<double>(total_sec_)) {
         advance_track();
     }
@@ -2631,11 +3034,16 @@ void App::handle_key(int key) {
                 player_.pause();
             }
             break;
+        // Volume is a property of the device, not of a track, and has_track_ is
+        // now false for the whole of a track switch -- so gating these on it made
+        // the volume keys dead for the second or two a Spotify start takes. They
+        // never needed a track: set_volume() is a gain store, safe with no ring
+        // and no device, and it is what the next play() picks up anyway.
         case '1': // volume up
-            if (has_track_) player_.set_volume(std::min(100, player_.volume() + 5));
+            player_.set_volume(std::min(100, player_.volume() + 5));
             break;
         case '2': // volume down
-            if (has_track_) player_.set_volume(std::max(0, player_.volume() - 5));
+            player_.set_volume(std::max(0, player_.volume() - 5));
             break;
         case 'n': case 'N': // next -- the queue (if any) takes priority,
                              // same as auto-advance-on-finish does, and
@@ -3033,6 +3441,11 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
         } else {
             bars = fft_.compute_bars(48, viz_dt_);
         }
+    } else if (switch_in_flight_) {
+        // A switch is in flight: deliberately nothing about either track. The
+        // outgoing one has stopped and the incoming one is not playing yet, so
+        // the only honest thing to say is which one we are waiting for.
+        meta_rows[0] = switch_status_text();
     } else {
         meta_rows[0] = "no track loaded - press / to search, Enter to play";
     }
@@ -4526,6 +4939,10 @@ int App::run() {
 
         poll_spotify();
         poll_librespot();
+        // After both: the remote confirmation arrives inside poll_spotify() and
+        // the librespot staging advances inside poll_librespot(), so the UI is
+        // never a frame behind the signal that the new track is audible.
+        poll_pending_commit();
 
         if (has_track_ && !spotify_remote_) {
             player_.poll_elapsed();

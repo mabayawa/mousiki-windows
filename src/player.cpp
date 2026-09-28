@@ -135,6 +135,7 @@ bool Player::play(std::shared_ptr<PcmRing> pcm, double start_sec, int volume_pct
     ma_result init_res = ma_device_init(ctx, &cfg, &device_);
     if (init_res != MA_SUCCESS) {
         pcm_slots_[0].reset();
+        device_live_.store(false, std::memory_order_release);
         ConsoleLog::instance().log_verbose(
             std::string("audio: ma_device_init failed: ") + ma_result_description(init_res));
         return false;
@@ -143,10 +144,15 @@ bool Player::play(std::shared_ptr<PcmRing> pcm, double start_sec, int volume_pct
     if (start_res != MA_SUCCESS) {
         ma_device_uninit(&device_);
         pcm_slots_[0].reset();
+        device_live_.store(false, std::memory_order_release);
         ConsoleLog::instance().log_verbose(
             std::string("audio: ma_device_start failed: ") + ma_result_description(start_res));
         return false;
     }
+    // Only now is there a device that is actually pulling frames. Published
+    // before device_ready_ purely so the two cannot be read out of order by
+    // anyone who later confuses them.
+    device_live_.store(true, std::memory_order_release);
     ConsoleLog::instance().log_verbose(
         std::string("audio: device started, backend=") + ma_get_backend_name(device_.pContext->backend) +
         ", rate=" + std::to_string(sample_rate_.load()) + "Hz" +
@@ -237,6 +243,9 @@ double Player::poll_elapsed() const {
 }
 
 void Player::stop() {
+    // Cleared BEFORE ma_device_uninit, not after: the main thread must never
+    // believe in a device that is being torn down.
+    device_live_.store(false, std::memory_order_release);
     // ma_device_uninit() must come first: it stops the audio callback, so by
     // the time the buffers are released nothing can still be reading them.
     if (device_ready_) {

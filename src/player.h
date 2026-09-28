@@ -110,6 +110,20 @@ public:
     // clear it out from under a switch that is still in flight.
     void begin_track_switch();
 
+    // True from begin_track_switch() until the incoming ring is installed by
+    // play()/adopt_ring(). App polls this every frame as one third of its "is
+    // the new track actually audible yet" test -- see
+    // App::pending_track_audible().
+    bool is_switching() const { return switching_.load(std::memory_order_acquire); }
+
+    // True only between a successful ma_device_start() and stop(). Needed
+    // because play() clears switching_ BEFORE ma_device_init (see the comment
+    // there -- deliberately, so the first callback of the new device already
+    // plays audio), so !is_switching() on its own is ALSO true for a play()
+    // that then failed to open a device. Committing the UI on that would mean
+    // showing a track that can never be heard.
+    bool device_live() const { return device_live_.load(std::memory_order_acquire); }
+
     void stop();
 
 private:
@@ -117,6 +131,10 @@ private:
     bool context_ready_ = false;
     ma_device device_{};
     bool device_ready_ = false;
+    // The main-thread-readable mirror of device_ready_. That one is only ever
+    // touched by the device worker and is not atomic, so the render loop cannot
+    // look at it.
+    std::atomic<bool> device_live_{false};
 
     // Two slots rather than one pointer, so adopt_ring() can hand the callback
     // a new buffer without a lock and without freeing the old one.

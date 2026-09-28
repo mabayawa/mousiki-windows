@@ -1,5 +1,7 @@
 #include "spotify_control.h"
 
+#include <algorithm>
+
 #include "console_log.h"
 
 namespace muisc {
@@ -12,6 +14,11 @@ void SpotifyControl::stop() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         quit_ = true;
+        // Everything queued is about to be thrown away, so mark it complete
+        // first: a staged track start waits on a ticket, and a shutdown that
+        // dropped the command without completing the ticket would leave that
+        // wait unsatisfiable forever.
+        for (const Cmd& c : queue_) note_completed(c.ticket);
         queue_.clear();
     }
     cv_.notify_all();
@@ -35,42 +42,87 @@ void SpotifyControl::ensure_worker() {
     });
 }
 
-void SpotifyControl::submit(Cmd c) {
-    if (!src_) return;
+void SpotifyControl::note_completed(Ticket t) {   // mu_ held by the caller
+    if (t > completed_.load(std::memory_order_relaxed)) {
+        completed_.store(t, std::memory_order_release);
+    }
+}
+
+SpotifyControl::Ticket SpotifyControl::submit(Cmd c) {
+    if (!src_) return 0;
     ensure_worker();
+    Ticket t = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (quit_) return;
+        if (quit_) return 0;
+        // Assigned under mu_, so ticket order is queue order -- which is what
+        // lets completed() be a single high-water mark rather than a set.
+        t = c.ticket = ++next_ticket_;
         queue_.push_back(std::move(c));
         pending_.fetch_add(1, std::memory_order_relaxed);
     }
     cv_.notify_one();
+    return t;
 }
 
-void SpotifyControl::play(const std::string& device_id, std::vector<std::string> uris,
-                          long long position_ms) {
-    Cmd c{Cmd::Kind::Play, device_id, std::move(uris), position_ms};
-    submit(std::move(c));
+SpotifyControl::Ticket SpotifyControl::pause_now(const std::string& device_id) {
+    if (!src_) return 0;
+    ensure_worker();
+    Ticket t = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (quit_) return 0;
+        Ticket dropped_hi = 0;
+        for (auto it = queue_.begin(); it != queue_.end();) {
+            if (is_superseded_by_pause(it->kind)) {
+                dropped_hi = (std::max)(dropped_hi, it->ticket);
+                pending_.fetch_sub(1, std::memory_order_relaxed);
+                it = queue_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Dropping counts as completing: the command will never run, so
+        // anything waiting on it must not wait forever. Every dropped ticket is
+        // older than the one issued just below, so this cannot pre-complete the
+        // pause itself.
+        if (dropped_hi) note_completed(dropped_hi);
+
+        t = ++next_ticket_;
+        queue_.push_front(Cmd{Cmd::Kind::Pause, device_id, {}, -1, t});
+        pending_.fetch_add(1, std::memory_order_relaxed);
+    }
+    cv_.notify_one();
+    return t;
 }
 
-void SpotifyControl::enqueue(const std::string& device_id, const std::string& uri) {
-    submit(Cmd{Cmd::Kind::Queue, device_id, {uri}, -1});
+SpotifyControl::Ticket SpotifyControl::play(const std::string& device_id,
+                                           std::vector<std::string> uris,
+                                           long long position_ms) {
+    Cmd c{Cmd::Kind::Play, device_id, std::move(uris), position_ms, 0};
+    return submit(std::move(c));
 }
 
-void SpotifyControl::pause(const std::string& device_id) {
-    submit(Cmd{Cmd::Kind::Pause, device_id, {}, -1});
+SpotifyControl::Ticket SpotifyControl::enqueue(const std::string& device_id,
+                                               const std::string& uri) {
+    return submit(Cmd{Cmd::Kind::Queue, device_id, {uri}, -1, 0});
 }
 
-void SpotifyControl::resume(const std::string& device_id) {
-    submit(Cmd{Cmd::Kind::Resume, device_id, {}, -1});
+SpotifyControl::Ticket SpotifyControl::pause(const std::string& device_id) {
+    return submit(Cmd{Cmd::Kind::Pause, device_id, {}, -1, 0});
 }
 
-void SpotifyControl::seek(const std::string& device_id, long long position_ms) {
-    submit(Cmd{Cmd::Kind::Seek, device_id, {}, position_ms});
+SpotifyControl::Ticket SpotifyControl::resume(const std::string& device_id) {
+    return submit(Cmd{Cmd::Kind::Resume, device_id, {}, -1, 0});
 }
 
-void SpotifyControl::next(const std::string& device_id) {
-    submit(Cmd{Cmd::Kind::Next, device_id, {}, -1});
+SpotifyControl::Ticket SpotifyControl::seek(const std::string& device_id,
+                                            long long position_ms) {
+    return submit(Cmd{Cmd::Kind::Seek, device_id, {}, position_ms, 0});
+}
+
+SpotifyControl::Ticket SpotifyControl::next(const std::string& device_id) {
+    return submit(Cmd{Cmd::Kind::Next, device_id, {}, -1, 0});
 }
 
 void SpotifyControl::request_devices() {
@@ -80,7 +132,7 @@ void SpotifyControl::request_devices() {
         if (devices_inflight_) return;   // coalesce
         devices_inflight_ = true;
     }
-    submit(Cmd{Cmd::Kind::Devices, {}, {}, -1});
+    submit(Cmd{Cmd::Kind::Devices, {}, {}, -1, 0});
 }
 
 void SpotifyControl::request_state() {
@@ -90,7 +142,7 @@ void SpotifyControl::request_state() {
         if (state_inflight_) return;     // coalesce
         state_inflight_ = true;
     }
-    submit(Cmd{Cmd::Kind::State, {}, {}, -1});
+    submit(Cmd{Cmd::Kind::State, {}, {}, -1, 0});
 }
 
 void SpotifyControl::worker_loop() {
@@ -146,6 +198,13 @@ void SpotifyControl::worker_loop() {
         if (!ok && !err.empty()) {
             std::lock_guard<std::mutex> lk(out_mu_);
             error_out_ = err;
+        }
+        {
+            // AFTER the round trip returned, so completed(t) means "Spotify has
+            // answered", not "we sent it". A caller waiting on a pause ticket is
+            // waiting for the audio to have actually stopped.
+            std::lock_guard<std::mutex> lk(mu_);
+            note_completed(c.ticket);
         }
         pending_.fetch_sub(1, std::memory_order_relaxed);
     }
