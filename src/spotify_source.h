@@ -70,11 +70,13 @@ struct SpotifyProfile {
     std::string display_name;
     std::string product;
     std::string country;
-    // The market the helper resolved for this token, or empty when it could not.
-    // Empty is why tracks unavailable in the user region cannot be filtered out:
-    // Spotify only reports is_playable when a market is supplied. It is empty for
-    // exactly the same reason product is -- a token minted before
-    // user-read-private was requested reports no country.
+    // The market the helper resolved for this token, or empty when it could not --
+    // which is empty for exactly the same reason product is: a token minted
+    // before user-read-private was requested. It does NOT gate the
+    // unplayable-track filter. Spotify decides availability from the account on
+    // any user-token request, measured identical with and without an explicit
+    // market parameter, so the filter works for a token that cannot name a
+    // market at all.
     std::string market;
 };
 

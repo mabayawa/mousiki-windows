@@ -278,8 +278,9 @@ def cmd_status(client_id):
         "product": me.get("product"),          # "premium" / "free"
         "country": me.get("country"),
         # The resolved market, "" when this token cannot tell us one. The app
-        # shows a hint when it is empty, because an empty market is exactly why
-        # tracks unavailable in the user region cannot be filtered out.
+        # only uses it to explain an unknown plan: both are empty for the same
+        # reason, a token minted before user-read-private. It does NOT gate the
+        # unplayable filter -- see the note above user_market.
         "market": user_market(tok),
     })
 
@@ -329,10 +330,11 @@ def _unwrap(entry):
 def _track_obj(t, album_name=None):
     if not t or t.get("is_local"):
         return None
-    # Unplayable in this market. Present ONLY when the request supplied a market
-    # (see user_market above); `is False` rather than a falsy test on purpose, so
-    # an absent field still counts as playable and nothing is dropped when the
-    # market could not be resolved.
+    # Unplayable for this user. Spotify sets this from the account region on any
+    # user-token request, with or without an explicit market parameter, so the
+    # filter does not depend on resolving one. `is False` rather than a falsy
+    # test on purpose: the field is absent on endpoints that do not report it,
+    # and absent must mean playable, not dropped.
     if t.get("is_playable") is False:
         return None
     artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a)
@@ -458,18 +460,23 @@ def cmd_saved(client_id):
     emit({"ok": True, "tracks": out})
 
 
-# Every track-returning endpoint is asked for a MARKET where one is known,
-# because Spotify only populates "is_playable" when one is supplied. Without it
-# the API returns tracks that cannot be played in the user region, they show up
-# in the list, and selecting one plays nothing at all. Supplying a market also
-# enables track RELINKING, so it recovers playable equivalents as well as hiding
-# dead entries.
+# Track-returning endpoints are asked for a MARKET where one is known, which
+# enables track RELINKING: where Spotify has a playable equivalent of an
+# unavailable track it returns that instead, so a market recovers tracks as well
+# as identifying dead ones.
 #
-# NOT "from_token", which needs the token to resolve to a market and returns
-# HTTP 403 on /search when it cannot -- a token minted before user-read-private
-# was requested reports a null country and cannot. An explicit ISO code is used
-# instead, and when even that is unknown the parameter is OMITTED rather than
-# guessed: no filtering is strictly better than every request failing.
+# It is NOT what makes "is_playable" appear. Measured on a real account: the
+# field is populated identically with and without this parameter, because every
+# request here carries a USER token and Spotify knows that user region whether or
+# not it will name it. Reading /me for the country needs user-read-private;
+# deciding availability does not. So the unplayable filter below works even for a
+# token that cannot report a market -- do not "fix" that by making the filter
+# conditional on one.
+#
+# Specifically NOT "from_token", which requires the token to resolve to a market
+# and returns HTTP 403 on /search when it cannot -- which a token minted before
+# user-read-private does not. An explicit ISO code is used instead, and when even
+# that is unknown the parameter is omitted rather than guessed.
 def user_market(tok):
     """ISO country for this token, or "" when the token cannot tell us.
 

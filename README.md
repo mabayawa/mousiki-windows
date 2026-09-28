@@ -162,11 +162,13 @@ than one per row. Nothing is written to disk.
 A playlist can show a track count larger than the list beneath it. Spotify counts
 things in that total that cannot be streamed here — local files, and tracks
 unavailable in your country — so they are dropped and the pane says how many.
-Hiding the unavailable ones needs a market, which mousiki reads from your
-account; if your saved login predates the `user-read-private` scope it has no
-market to report, the browser says so once on opening, and re-running
-`python scripts\spotify.py --client-id <your id> login` fixes it (and replaces
-"plan unknown" with your real plan). Below 72 columns only the focused pane is
+On one real library that is 33 of 572 saved tracks.
+
+Separately, if the browser header says "plan unknown", your saved login predates
+the `user-read-private` scope and Spotify will not report your plan or your
+region to it. Re-running `python scripts\spotify.py --client-id <your id> login`
+fixes that. It does **not** affect which tracks are hidden — availability is
+decided from your account either way. Below 72 columns only the focused pane is
 drawn, at full width, and `TAB` switches between the two views instead.
 
 Needs `SpotifyClientId` in `config.txt`, the same as `/sp:` search — see

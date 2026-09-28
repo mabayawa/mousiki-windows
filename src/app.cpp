@@ -4107,16 +4107,18 @@ void App::poll_pending_library() {
                   ? ("spotify library: " + std::to_string(library_.items.size()) + " items")
                   : ("spotify library: " + library_.error));
 
-    // An empty market means the helper could not learn which country this token
-    // belongs to, which is the ONLY reason tracks unavailable in that country
-    // still appear: Spotify reports is_playable only when a market is supplied.
-    // It is empty for the same reason product is -- the cached token predates
-    // user-read-private -- so one re-authorisation fixes both, and saying so is
-    // more use than silently listing tracks that will not play.
-    if (library_.ok && library_.profile.market.empty()) {
-        status_line_ = "spotify: re-run the helper login to hide unavailable tracks and show your plan";
-        log_event("spotify: no market for this token (needs user-read-private); "
-                  "unavailable tracks cannot be filtered and the plan reads as unknown");
+    // An empty market and an unknown plan have one shared cause: a token minted
+    // before user-read-private was requested. Spotify will not name the account
+    // region or product without it.
+    //
+    // This does NOT affect the unplayable-track filter, which works either way --
+    // availability is decided from the account on any user-token request. The
+    // hint exists only so "plan unknown" in the header above has a visible
+    // explanation instead of looking like a bug.
+    if (library_.ok && library_.profile.product.empty()) {
+        status_line_ = "spotify: plan unknown -- re-run the helper login to report it";
+        log_event("spotify: this token predates user-read-private, so the plan and "
+                  "the account region are unreported (unavailable tracks are still filtered)");
     }
 }
 
