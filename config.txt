@@ -206,6 +206,7 @@ HKeyConsole="t"
 HKeyToggleMute="x"
 HKeyCheatsheet="?"
 HKeyRetryLyrics="l"
+HKeySpotifyLibrary="o"
 
 ##-------------------------------------------
 ##             PANEL 5: ABOUT APP

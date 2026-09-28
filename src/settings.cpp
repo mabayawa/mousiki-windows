@@ -321,6 +321,7 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyToggleMute",                  "x"},
             {"HKeyCheatsheet",                  "?"},
             {"HKeyRetryLyrics",                 "l"},
+            {"HKeySpotifyLibrary",              "o"},
         };
         for (const auto& [action, key] : defaults) {
             // Only fill actions that are entirely absent from the config.
@@ -932,7 +933,7 @@ void save_settings(const Settings& s) {
     static const char* hkey_order[] = {
         "HKeyNavigateUp", "HKeyNavigateDown", "HKeyPlay", "HKeyPlayNextSong", "HKeyPlayPreviousSong",
         "HKeyTogglePlayPause", "HKeyCyclePlayMode", "HKeySearch", "HKeySearchOnline",
-        "HKeySearchSpotify",
+        "HKeySearchSpotify", "HKeySpotifyLibrary",
         "HKeySeekForward", "HKeySeekBackward", "HKeyIncreaseVolume", "HKeyDecreaseVolume",
         "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeyBulkAddPlaylist",
         "HKeySwitchBetweenCards",

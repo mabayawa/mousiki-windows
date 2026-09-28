@@ -10,7 +10,9 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#include "library_view.h"
 #include "path_utf8.h"
+#include "spotify_library.h"
 #if defined(_WIN32)
 #include "win_compat.h"
 #else
@@ -1773,9 +1775,17 @@ static const char* kRefHotkeyNames[] = {
     "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeySwitchBetweenCards",
     "HKeyFilterForFolder", "HKeyClearFilter", "HKeyDownloadStream",
     "HKeyRefreshUi", "HKeyConsole", "HKeyToggleMute", "HKeyCheatsheet", "HKeyRetryLyrics",
-    "HKeySearchSpotify", "HKeyBulkAddPlaylist",
+    "HKeySearchSpotify", "HKeyBulkAddPlaylist", "HKeySpotifyLibrary",
 };
-static constexpr int kRefRowCount = 27;
+static constexpr int kRefRowCount = 28;
+// kRefHotkeyNames and ref_l (in build_settings_screen) are parallel arrays, and
+// they had silently drifted: 27 names against 25 labels, so ref_l[25] and
+// ref_l[26] were nullptr and pad(ref_l[i], 25) constructed a std::string from a
+// null pointer -- undefined behaviour the moment this tab scrolled that far.
+// These two assertions are the actual fix; adding the missing labels only
+// cleared the current instance.
+static_assert(std::size(kRefHotkeyNames) == kRefRowCount,
+              "kRefHotkeyNames must have exactly kRefRowCount entries");
 
 std::string* App::color_field_ptr(int row, int col) {
     switch (row) {
@@ -2821,8 +2831,144 @@ void App::handle_key(int key) {
     }
 
     if (mode_ == Mode::Cheatsheet) {
-        if (key == 27 || key == '?') mode_ = Mode::Browse;
+        if (key == 27 || key == '?') { mode_ = Mode::Browse; return; }
+        // It scrolls now: the row table outgrew what fits on a normal terminal,
+        // and it used to be indexed BY SCREEN ROW, so anything past the visible
+        // count was silently never drawn at all.
+        if (key == 'A') { cheatsheet_scroll_ = std::max(0, cheatsheet_scroll_ - 1); return; }
+        if (key == 'B') { ++cheatsheet_scroll_; return; }  // clamped when rendering
         return;
+    }
+
+    if (mode_ == Mode::SpotifyLibrary) {
+        if (lib_filtering_) {
+            // Text entry. Letters must NOT reach the command keys below, or
+            // typing "add" into the filter would queue a whole playlist on the a.
+            if (key == 27) {                       // ESC abandons the filter
+                lib_filtering_ = false;
+                lib_filter_.clear();
+                library_refresh_filter();
+                return;
+            }
+            if (key == '\r' || key == '\n') {      // keep it, stop typing
+                lib_filtering_ = false;
+                return;
+            }
+            if (key == 127 || key == 8) {
+                if (!lib_filter_.empty()) lib_filter_.pop_back();
+                library_refresh_filter();
+                return;
+            }
+            // Arrows still navigate while typing, which is the point of an
+            // incremental filter. The cost is that A and B cannot be TYPED into
+            // it -- poll_key() collapses the arrow keys onto them. The filter is
+            // case-insensitive, so lowercase a and b reach the same rows.
+            if (key == 'A' || key == 'B') {
+                lib_item_cursor_ += (key == 'B') ? 1 : -1;
+                clamp_cursor_scroll(lib_item_cursor_, lib_item_scroll_,
+                                    static_cast<int>(lib_visible_.size()), lib_body_rows_);
+                lib_cursor_moved_at_ = std::chrono::steady_clock::now();
+                return;
+            }
+            if (key >= 32 && key < 127 && lib_filter_.size() < 64) {
+                lib_filter_ += static_cast<char>(key);
+                library_refresh_filter();
+                lib_cursor_moved_at_ = std::chrono::steady_clock::now();
+            }
+            return;
+        }
+
+        // ESC clears a filter first and only closes on the second press, so
+        // leaving a filter never costs the whole view.
+        if (key == 27) {
+            if (!lib_filter_.empty()) {
+                lib_filter_.clear();
+                library_refresh_filter();
+                return;
+            }
+            mode_ = Mode::Browse;
+            status_line_.clear();
+            return;
+        }
+        // The opening key closes it again, as t does for Console and ? for the
+        // cheatsheet.
+        if (key == 'o' || key == 'O') {
+            mode_ = Mode::Browse;
+            status_line_.clear();
+            return;
+        }
+        if (key == 9) {   // TAB
+            lib_pane_ = (lib_pane_ == LibPane::Items) ? LibPane::Tracks : LibPane::Items;
+            return;
+        }
+        if (key == 'D') { lib_pane_ = LibPane::Items;  return; }   // left arrow
+        if (key == 'C') { lib_pane_ = LibPane::Tracks; return; }   // right arrow
+        if (key == 'A' || key == 'B') {
+            const int delta = (key == 'B') ? 1 : -1;
+            if (lib_pane_ == LibPane::Items) {
+                lib_item_cursor_ += delta;
+                clamp_cursor_scroll(lib_item_cursor_, lib_item_scroll_,
+                                    static_cast<int>(lib_visible_.size()), lib_body_rows_);
+                // Only stamps the time. poll_pending_library_tracks() starts the
+                // fetch once the cursor has been still for the debounce, so
+                // holding Down through the library is one request, not one per row.
+                lib_cursor_moved_at_ = std::chrono::steady_clock::now();
+            } else {
+                lib_track_cursor_ += delta;
+                clamp_cursor_scroll(lib_track_cursor_, lib_track_scroll_,
+                                    static_cast<int>(lib_tracks_.size()), lib_body_rows_);
+            }
+            return;
+        }
+        if (key == '/') { lib_filtering_ = true; return; }
+        if (key == 'c') {   // mirrors the Browse clear-filter key
+            lib_filter_.clear();
+            library_refresh_filter();
+            return;
+        }
+        if (key == 'r' || key == 'R') {
+            if (!lib_in_progress_.load()) {
+                library_loaded_ = false;
+                launch_library_async(true);
+            }
+            return;
+        }
+        if (key == 'a') {
+            const SpotifyLibraryItem* hov = library_hovered();
+            if (!hov) { status_line_ = "nothing selected"; return; }
+            auto it = lib_track_cache_.find(hov->id);
+            if (it != lib_track_cache_.end()) {
+                const int n = library_queue_tracks(it->second);
+                status_line_ = n ? ("queued " + std::to_string(n) + (n == 1 ? " track" : " tracks")
+                                    + " from " + hov->name)
+                                 : ("nothing playable to queue in " + hov->name);
+            } else {
+                // Pressed before the tracks arrived. Remember which item and
+                // queue it when the result lands, rather than telling the user to
+                // press the key again.
+                lib_queue_when_loaded_ = hov->id;
+                status_line_ = "loading " + hov->name + " ...";
+                if (!lib_tracks_in_progress_.load()) launch_library_tracks_async(*hov);
+            }
+            return;
+        }
+        if (key == '\r' || key == '\n') {
+            if (lib_pane_ == LibPane::Items) { lib_pane_ = LibPane::Tracks; return; }
+            if (lib_track_cursor_ >= 0 && lib_track_cursor_ < static_cast<int>(lib_tracks_.size())) {
+                const OnlineResult& r = lib_tracks_[lib_track_cursor_];
+                library_queue_tracks({r});
+                status_line_ = "queued " + r.title;
+            }
+            return;
+        }
+        // Transport passes through, deliberately unlike Console and Cheatsheet,
+        // which swallow everything. This is a surface you SIT in while music
+        // plays, and none of these four collide with the keys above.
+        if (key == 'p' || key == 'P' || key == '1' || key == '2' || key == 'x' || key == 'X') {
+            // fall through to the Browse switch below
+        } else {
+            return;
+        }
     }
 
     if (mode_ == Mode::BulkAdd) {
@@ -3139,6 +3285,10 @@ void App::handle_key(int key) {
             break;
         case '?': // cheatsheet overlay
             mode_ = Mode::Cheatsheet;
+            cheatsheet_scroll_ = 0;
+            break;
+        case 'o': case 'O': // spotify library overlay
+            open_spotify_library();
             break;
         case 'f': case 'F': // filter local list to the hovering track's folder
             if (list_source_ == ListSource::Local && !local_view_.empty() &&
@@ -3811,6 +3961,457 @@ std::vector<std::string> App::build_search_bar(int total_width) const {
     return out;
 }
 
+// ---------------------------------------------------------------------
+// Spotify library overlay (HKeySpotifyLibrary, the o key)
+// ---------------------------------------------------------------------
+
+void App::open_spotify_library() {
+    if (!spotify_.enabled()) {
+        // Same wording as the sp: search path, so one cause produces one
+        // message whichever door the user came through. No mode change, no
+        // thread, no subprocess.
+        status_line_ = "spotify: set SpotifyClientId in config.txt first";
+        return;
+    }
+    mode_ = Mode::SpotifyLibrary;
+    lib_pane_ = LibPane::Items;
+    lib_filtering_ = false;
+    // A filter left over from last time would be invisible until the header row
+    // is read, and would look like a library that had lost most of its rows.
+    lib_filter_.clear();
+    library_refresh_filter();
+    lib_cursor_moved_at_ = std::chrono::steady_clock::now();
+    if (!library_loaded_ && !lib_in_progress_.load()) launch_library_async(false);
+}
+
+void App::library_refresh_filter() {
+    lib_visible_ = library_filter_indices(library_.items, lib_filter_);
+    clamp_cursor_scroll(lib_item_cursor_, lib_item_scroll_,
+                        static_cast<int>(lib_visible_.size()), lib_body_rows_);
+}
+
+const SpotifyLibraryItem* App::library_hovered() const {
+    if (lib_item_cursor_ < 0 || lib_item_cursor_ >= static_cast<int>(lib_visible_.size())) return nullptr;
+    const int idx = lib_visible_[lib_item_cursor_];
+    if (idx < 0 || idx >= static_cast<int>(library_.items.size())) return nullptr;
+    return &library_.items[idx];
+}
+
+int App::library_queue_tracks(const std::vector<OnlineResult>& items) {
+    // N push_backs into a plain main-thread vector. The queue is local -- the
+    // Spotify queue endpoint is only ever used for a one-track gapless lookahead
+    // -- so a 300-track playlist costs no HTTP at all and there is nothing to
+    // pace, cap or show progress for.
+    const int n = append_online(queue_, items);
+    clamp_queue_selected();
+    if (n) log_event("queued " + std::to_string(n) + (n == 1 ? " track" : " tracks") + " from the spotify library");
+    return n;
+}
+
+void App::launch_library_async(bool force_refresh) {
+    if (lib_thread_.joinable()) lib_thread_.join();
+    lib_in_progress_ = true;
+    lib_ready_ = false;
+    if (force_refresh) {
+        lib_track_cache_.clear();
+        lib_tracks_.clear();
+        lib_tracks_key_.clear();
+        lib_tracks_error_.clear();
+        lib_tracks_dropped_ = 0;
+    }
+    status_line_ = "spotify: loading your library ...";
+    lib_thread_ = std::thread([this]() {
+        LibrarySnapshot snap;
+        try {
+            std::string e_profile, e_playlists, e_albums;
+            // Not fatal on its own: a token minted before user-read-private
+            // still lists playlists perfectly well, it just cannot say who it
+            // belongs to -- which build_library_rows handles by claiming nothing.
+            spotify_.profile(snap.profile, &e_profile);
+            auto playlists = spotify_.playlists(&e_playlists);
+            auto albums = spotify_.saved_albums(&e_albums);
+            snap.items = build_library_rows(snap.profile.id, playlists, albums);
+            // An EMPTY library with no errors is a SUCCESS, not a failure. The
+            // two render very differently, and getting this backwards would make
+            // a new account look broken.
+            snap.ok = e_playlists.empty() && e_albums.empty();
+            if (!snap.ok) snap.error = !e_playlists.empty() ? e_playlists : e_albums;
+        } catch (const std::exception& e) {
+            snap.error = std::string("spotify: ") + e.what();
+        } catch (...) {
+            snap.error = "spotify: unknown error";
+        }
+        std::lock_guard<std::mutex> lk(lib_mutex_);
+        pending_library_ = std::move(snap);
+        lib_ready_ = true;
+    });
+}
+
+void App::poll_pending_library() {
+    if (!lib_ready_.load()) return;
+    LibrarySnapshot res;
+    {
+        std::lock_guard<std::mutex> lk(lib_mutex_);
+        if (!lib_ready_.load()) return;
+        res = std::move(pending_library_);
+        lib_ready_ = false;
+    }
+    lib_in_progress_ = false;
+    if (lib_thread_.joinable()) lib_thread_.join();
+
+    library_ = std::move(res);
+    // Only a success is cached. A failure leaves this false so the next press
+    // retries by itself rather than showing a stale error for the whole session.
+    library_loaded_ = library_.ok;
+    lib_item_cursor_ = 0;
+    lib_item_scroll_ = 0;
+    library_refresh_filter();
+    lib_cursor_moved_at_ = std::chrono::steady_clock::now();
+    status_line_ = library_.ok ? std::string() : library_.error;
+    log_event(library_.ok
+                  ? ("spotify library: " + std::to_string(library_.items.size()) + " items")
+                  : ("spotify library: " + library_.error));
+}
+
+void App::launch_library_tracks_async(const SpotifyLibraryItem& item) {
+    if (lib_tracks_thread_.joinable()) lib_tracks_thread_.join();
+    lib_tracks_in_progress_ = true;
+    lib_tracks_ready_ = false;
+    const std::string id = item.id;
+    const bool is_album = (item.kind == SpotifyLibraryItem::Kind::Album);
+    const int declared = item.tracks;
+    lib_tracks_thread_ = std::thread([this, id, is_album, declared]() {
+        LibTracksResult res;
+        res.key = id;
+        res.declared_total = declared;
+        try {
+            res.items = is_album ? spotify_.album_tracks(id, &res.error)
+                                 : spotify_.playlist_tracks(id, &res.error);
+        } catch (const std::exception& e) {
+            res.error = std::string("spotify: ") + e.what();
+        } catch (...) {
+            res.error = "spotify: unknown error";
+        }
+        std::lock_guard<std::mutex> lk(lib_tracks_mutex_);
+        pending_lib_tracks_ = std::move(res);
+        lib_tracks_ready_ = true;
+    });
+}
+
+void App::poll_pending_library_tracks() {
+    if (lib_tracks_ready_.load()) {
+        LibTracksResult res;
+        {
+            std::lock_guard<std::mutex> lk(lib_tracks_mutex_);
+            if (!lib_tracks_ready_.load()) return;
+            res = std::move(pending_lib_tracks_);
+            lib_tracks_ready_ = false;
+        }
+        lib_tracks_in_progress_ = false;
+        if (lib_tracks_thread_.joinable()) lib_tracks_thread_.join();
+
+        // A failure must NOT poison the cache, or moving away and back, and the
+        // reload key, would both keep showing the same stale error forever.
+        if (res.error.empty()) lib_track_cache_[res.key] = res.items;
+
+        const SpotifyLibraryItem* hov = library_hovered();
+        if (hov && hov->id == res.key) {   // the cursor has not moved on
+            lib_tracks_ = res.items;
+            lib_tracks_key_ = res.key;
+            lib_tracks_dropped_ = std::max(0, res.declared_total - static_cast<int>(res.items.size()));
+            lib_tracks_error_ = res.error;
+            lib_track_cursor_ = 0;
+            lib_track_scroll_ = 0;
+        }
+        if (!lib_queue_when_loaded_.empty() && lib_queue_when_loaded_ == res.key) {
+            lib_queue_when_loaded_.clear();
+            if (res.error.empty()) {
+                const int n = library_queue_tracks(res.items);
+                status_line_ = n ? ("queued " + std::to_string(n) + (n == 1 ? " track" : " tracks"))
+                                 : "nothing playable to queue there";
+            } else {
+                status_line_ = res.error;
+            }
+        }
+    }
+
+    if (mode_ != Mode::SpotifyLibrary || lib_tracks_in_progress_.load()) return;
+    const SpotifyLibraryItem* hov = library_hovered();
+    if (!hov) return;
+    // count(), not empty(): an empty result is a real answer (an empty playlist,
+    // or one holding only local files), and testing empty() would refetch those
+    // two on every single cursor rest.
+    if (lib_track_cache_.count(hov->id)) {
+        if (lib_tracks_key_ != hov->id) {
+            lib_tracks_ = lib_track_cache_[hov->id];
+            lib_tracks_key_ = hov->id;
+            lib_tracks_dropped_ = std::max(0, hov->tracks - static_cast<int>(lib_tracks_.size()));
+            lib_tracks_error_.clear();
+            lib_track_cursor_ = 0;
+            lib_track_scroll_ = 0;
+        }
+        return;
+    }
+    const double still = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - lib_cursor_moved_at_).count();
+    if (still >= kLibTrackDebounceSec) launch_library_tracks_async(*hov);
+}
+
+std::vector<std::string> App::build_library_items_pane(int total_width, int body_h) const {
+    const int inner = std::max(0, total_width - 4);
+    const std::string border = ansi_for(settings_.border_color, false);
+    const std::string border_bottom = ansi_for(settings_.border_color_bottom, false);
+    const bool focused = (lib_pane_ == LibPane::Items);
+    const int total = static_cast<int>(lib_visible_.size());
+
+    std::string label = "SPOTIFY LIBRARY";
+    if (total > 0) {
+        label += " (" + std::to_string(lib_item_cursor_ + 1) + "/" + std::to_string(total) + ")";
+    }
+    if (focused) label += " (focused)";
+    // box_top ends in pad_right(s, total_width), which for an over-wide label
+    // calls utf8_take and eats the CLOSING CORNER GLYPH. Shorten it first.
+    label = truncate_str(label, std::max(0, total_width - 6));
+
+    std::vector<std::string> out;
+    out.push_back(box_top(label, total_width, border));
+
+    std::string head;
+    if (lib_in_progress_.load()) {
+        head = "loading ...";
+    } else if (!library_.ok && library_.items.empty()) {
+        head = library_.error.empty() ? "not loaded" : library_.error;
+    } else {
+        const std::string who = library_.profile.display_name.empty()
+                                    ? std::string("spotify") : library_.profile.display_name;
+        // Empty means UNKNOWN, never free: a token minted before
+        // user-read-private omits it, and rendering it as free would tell the
+        // user they cannot stream when they can.
+        const std::string plan = library_.profile.product.empty()
+                                     ? std::string("plan unknown") : library_.profile.product;
+        int lists = 0, albums = 0;
+        for (const auto& it : library_.items) {
+            if (it.kind == SpotifyLibraryItem::Kind::Album) ++albums;
+            else ++lists;
+        }
+        head = who + "  \u00b7  " + plan + "  \u00b7  " + std::to_string(lists) + " playlists"
+             + "  \u00b7  " + std::to_string(albums) + " albums";
+    }
+    out.push_back(box_line(head, total_width, border));
+
+    // The filter lives on its own row, blank when unused, so turning it on never
+    // changes the pane height.
+    std::string filt;
+    if (lib_filtering_) filt = "filter: " + lib_filter_ + "\u2588";
+    else if (!lib_filter_.empty()) filt = "filter: " + lib_filter_;
+    out.push_back(box_line(filt, total_width, border));
+
+    const int sep_w = display_width(settings_.list_separator) + 1;
+    const int kind_w = std::max(display_width("\u266b"), display_width("\u25a4"));
+    const LeftCols c = left_pane_columns(inner, sep_w, kind_w);
+
+    std::string empty_msg;
+    if (total == 0) {
+        if (lib_in_progress_.load()) empty_msg = "LOADING YOUR LIBRARY ...";
+        else if (!library_.ok) empty_msg = "COULD NOT LOAD YOUR LIBRARY -- [r] RETRY";
+        else if (!lib_filter_.empty()) empty_msg = "NOTHING MATCHES THAT FILTER";
+        else empty_msg = "YOUR SPOTIFY LIBRARY IS EMPTY";
+    }
+
+    for (int row = 0; row < body_h; ++row) {
+        std::string content;
+        bool is_cursor = false;
+        if (!empty_msg.empty()) {
+            if (row == body_h / 2) content = center_pad(empty_msg, inner);
+        } else {
+            const int vi = lib_item_scroll_ + row;
+            if (vi < total) {
+                const SpotifyLibraryItem& it = library_.items[lib_visible_[vi]];
+                is_cursor = (vi == lib_item_cursor_);
+                const std::string kind =
+                    (it.kind == SpotifyLibraryItem::Kind::Album) ? "\u25a4" : "\u266b";
+                content = pad_right(std::to_string(vi + 1), c.idx) + kind
+                        + settings_.list_separator + " "
+                        + pad_right(truncate_str(it.name, c.name), c.name);
+                if (c.owner) {
+                    content += settings_.list_separator + " "
+                             + pad_right(truncate_str(it.owner, c.owner), c.owner);
+                }
+                if (c.count) {
+                    content += settings_.list_separator + " "
+                             + pad_left(std::to_string(it.tracks), c.count);
+                }
+            }
+        }
+        // Built plain, padded, and only THEN coloured: display_width counts ANSI
+        // escape bytes as columns, so colouring before padding would miscount the
+        // row and risk truncating straight through the reset.
+        const std::string bar = border + settings_.box_vertical + "\x1b[0m";
+        const std::string padded = pad_right(truncate_str(content, inner), inner);
+        std::string colour;
+        if (is_cursor && focused) {
+            colour = ansi_for(settings_.list_cursor_color) + bg_ansi_for(settings_.list_cursor_bg_color);
+        } else if (is_cursor) {
+            // Still marked in the unfocused pane, just not as the live cursor,
+            // which is what makes it obvious which pane TAB is driving.
+            colour = ansi_for(settings_.list_playing_color) + bg_ansi_for(settings_.list_playing_bg_color);
+        } else {
+            colour = ansi_for(settings_.list_color, false) + bg_ansi_for(settings_.list_inactive_bg_color);
+        }
+        out.push_back(bar + " " + colour + padded + "\x1b[0m " + bar);
+    }
+
+    std::string footer = overflow_footer(total, lib_item_scroll_, body_h);
+    if (footer.empty()) {
+        // Hints only while they fit whole: box_bottom truncates an over-wide
+        // footer through the corner glyph, not through its own tail.
+        const std::string full = "[TAB] panes  [/] filter  [a] queue all  [r] reload  [ESC] close";
+        const std::string mid = "[TAB] panes  [/] filter  [ESC] close";
+        if (display_width(full) + 6 <= total_width) footer = full;
+        else if (display_width(mid) + 6 <= total_width) footer = mid;
+        else footer = "[ESC] close";
+    }
+    out.push_back(box_bottom(total_width, footer, border_bottom));
+    return out;
+}
+
+std::vector<std::string> App::build_library_tracks_pane(int total_width, int body_h) const {
+    const int inner = std::max(0, total_width - 4);
+    const std::string border = ansi_for(settings_.border_color, false);
+    const std::string border_bottom = ansi_for(settings_.border_color_bottom, false);
+    const bool focused = (lib_pane_ == LibPane::Tracks);
+    const SpotifyLibraryItem* hov = library_hovered();
+    const bool showing_hovered = hov && lib_tracks_key_ == hov->id;
+    // Rows are shown ONLY when they are the hovered item. lib_tracks_ still holds
+    // the PREVIOUS item while the next fetch is in flight, and rendering it here
+    // put 24 rows under a label reading "setlist 1 (24)" for a playlist with six
+    // -- the count, the duration and the rows all describing different things at
+    // once. Zero rows lets the LOADING state show instead, which is the truth.
+    const int total = showing_hovered ? static_cast<int>(lib_tracks_.size()) : 0;
+
+    // The name verbatim, NOT uppercased: there is no Unicode-aware upcaser in
+    // this tree, and a byte-wise toupper corrupts every multi-byte name.
+    std::string label = hov ? library_label(hov->name, total_width) : std::string("TRACKS");
+    if (label.empty()) label = "TRACKS";
+    if (total > 0) label += " (" + std::to_string(total) + ")";
+    if (focused) label += " (focused)";
+    label = truncate_str(label, std::max(0, total_width - 6));
+
+    std::vector<std::string> out;
+    out.push_back(box_top(label, total_width, border));
+
+    std::string head;
+    if (!hov) {
+        head = "";
+    } else if (!showing_hovered) {
+        head = lib_tracks_in_progress_.load() ? "loading ..." : "";
+    } else {
+        head = fmt_duration_long(total_duration_sec(lib_tracks_));
+        if (!hov->owner.empty()) head += "  \u00b7  " + hov->owner;
+    }
+    out.push_back(box_line(head, total_width, border));
+
+    // Second header row: why a count and a track list can legitimately disagree.
+    // Spotify counts local files in a playlist total and the helper drops them,
+    // so without saying so a playlist of 37 local files reads as inexplicably
+    // empty.
+    std::string note;
+    if (!lib_tracks_error_.empty()) {
+        note = lib_tracks_error_;
+    } else if (showing_hovered && lib_tracks_dropped_ > 0) {
+        note = "(" + std::to_string(lib_tracks_dropped_)
+             + (lib_tracks_dropped_ == 1 ? " local file skipped)" : " local files skipped)");
+    }
+    out.push_back(box_line(note, total_width, border));
+
+    const int sep_w = display_width(settings_.list_separator) + 1;
+    const RightCols c = right_pane_columns(inner, sep_w);
+
+    std::string empty_msg;
+    if (total == 0) {
+        if (!hov) empty_msg = "\u2014";
+        else if (!lib_tracks_error_.empty()) empty_msg = "COULD NOT LOAD THOSE TRACKS";
+        else if (!showing_hovered) empty_msg = "LOADING ...";
+        else if (lib_tracks_dropped_ > 0) empty_msg = "NO PLAYABLE TRACKS";
+        else empty_msg = "NO TRACKS";
+    }
+
+    for (int row = 0; row < body_h; ++row) {
+        std::string content;
+        bool is_cursor = false;
+        bool is_playing = false;
+        if (!empty_msg.empty()) {
+            if (row == body_h / 2) content = center_pad(empty_msg, inner);
+        } else {
+            const int vi = lib_track_scroll_ + row;
+            if (vi < total) {
+                const OnlineResult& r = lib_tracks_[vi];
+                is_cursor = (vi == lib_track_cursor_);
+                is_playing = has_track_ && !current_is_local_ && !current_spotify_uri_.empty()
+                          && r.spotify_uri == current_spotify_uri_;
+                // The already-queued marker. queue_contains_uri refuses to match
+                // an empty uri, which is what stops every local and YouTube row
+                // in the queue from matching every Spotify row here.
+                const std::string mark = queue_contains_uri(queue_, r.spotify_uri) ? "\u2022" : " ";
+                content = pad_right(std::to_string(vi + 1), c.idx) + mark
+                        + settings_.list_separator + " "
+                        + pad_right(truncate_str(r.title, c.title), c.title);
+                if (c.artist) {
+                    content += settings_.list_separator + " "
+                             + pad_right(truncate_str(r.uploader, c.artist), c.artist);
+                }
+                if (c.dur) {
+                    content += settings_.list_separator + " "
+                             + pad_left(fmt_mmss(r.duration_sec), c.dur);
+                }
+            }
+        }
+        const std::string bar = border + settings_.box_vertical + "\x1b[0m";
+        const std::string padded = pad_right(truncate_str(content, inner), inner);
+        std::string colour;
+        if (is_cursor && focused) {
+            colour = ansi_for(settings_.queue_cursor_color) + bg_ansi_for(settings_.queue_cursor_bg_color);
+        } else if (is_playing) {
+            colour = ansi_for(settings_.queue_playing_color) + bg_ansi_for(settings_.queue_playing_bg_color);
+        } else {
+            colour = ansi_for(settings_.queue_color, false) + bg_ansi_for(settings_.queue_inactive_bg_color);
+        }
+        out.push_back(bar + " " + colour + padded + "\x1b[0m " + bar);
+    }
+
+    std::string footer = overflow_footer(total, lib_track_scroll_, body_h);
+    if (footer.empty()) {
+        const std::string full = "[ENTER] queue track  [a] queue all";
+        footer = (display_width(full) + 6 <= total_width) ? full : "[a] all";
+    }
+    out.push_back(box_bottom(total_width, footer, border_bottom));
+    return out;
+}
+
+void App::build_spotify_library_screen(std::ostringstream& frame, int W) const {
+    const int body_h = lib_body_rows_;
+    // Two panes at 40 columns leave about sixteen inner columns each, which
+    // cannot hold a row that identifies anything. Below the threshold only the
+    // focused pane is drawn, at full width, and TAB reads as switch-view.
+    if (W < kLibraryMinTwoPaneWidth) {
+        const auto lines = (lib_pane_ == LibPane::Items)
+                               ? build_library_items_pane(W, body_h)
+                               : build_library_tracks_pane(W, body_h);
+        for (const auto& l : lines) frame << l << "\n";
+        return;
+    }
+    const int left_w = W / 2;
+    const int right_w = W - left_w;   // exact 50/50, remainder to the right pane
+    const auto L = build_library_items_pane(left_w, body_h);
+    const auto R = build_library_tracks_pane(right_w, body_h);
+    const size_t rows = std::max(L.size(), R.size());
+    for (size_t i = 0; i < rows; ++i) {
+        const std::string a = (i < L.size()) ? L[i] : pad_right("", left_w);
+        const std::string b = (i < R.size()) ? R[i] : pad_right("", right_w);
+        frame << a << b << "\n";
+    }
+}
+
 std::vector<std::string> App::build_list_panel(int total_width, int height) const {
     bool online = (list_source_ == ListSource::Online);
     std::string label = online ? "ONLINE RESULTS"
@@ -4149,14 +4750,21 @@ void App::build_settings_screen(std::ostringstream& frame, int W, int player_h) 
         // player view, so this scrolls as one list (viewport follows
         // settings_row_, centered) rather than ever growing the panel
         // past player_h.
-        static const char* ref_l[kRefRowCount] = {"Open Settings", "Navigate Up", "Navigate Down", "Play / Pause",
+        // Deduced size, not [kRefRowCount], so a missing label is a compile error
+        // rather than a silent nullptr -- see the assertion beside
+        // kRefHotkeyNames. "Search Spotify" and "Bulk Add Playlist" were the two
+        // that were missing.
+        static const char* ref_l[] = {"Open Settings", "Navigate Up", "Navigate Down", "Play / Pause",
                                                     "Next Track", "Prev Track", "Cycle Play Mode",
                                                     "Search Local", "Search Online", "Quit Application",
                                                     "Seek Forward", "Seek Backward", "Volume Up", "Volume Down",
                                                     "Add To Queue", "Remove From Queue", "Switch Cards",
                                                     "Filter By Folder", "Clear Filter", "Download Stream",
                                                     "Refresh UI", "Console / Logs", "Toggle Mute", "Cheatsheet",
-                                                    "Retry Lyrics"};
+                                                    "Retry Lyrics", "Search Spotify", "Bulk Add Playlist",
+                                                    "Spotify Library"};
+        static_assert(std::size(ref_l) == kRefRowCount,
+                      "ref_l must pair one label with every kRefHotkeyNames entry");
         std::vector<char> letters;
         for (char c = 'A'; c <= 'Z'; ++c) if (settings_.font_map.count(c)) letters.push_back(c);
         int display_count = kRefRowCount + 1 + static_cast<int>(letters.size()); // +1 for the divider row
@@ -4318,20 +4926,52 @@ void App::build_cheatsheet_screen(std::ostringstream& frame, int W) const {
         {"HKeyToggleMute",                  "Mute (without pausing)"},
         {"HKeyCheatsheet",                  "This cheatsheet"},
         {"HKeyRetryLyrics",                 "Retry lyrics"},
+        {"HKeyPlay",                        "Play hovered row (list or queue)"},
+        {"HKeySpotifyLibrary",              "Browse your Spotify library"},
     };
 
     int height = std::max(term_rows_ - 4, 8); // real terminal height, minus this overlay's own top/bottom border rows
     int visible = std::max(1, height - 2);
     int total = static_cast<int>(std::size(rows));
+    int inner = std::max(1, W - 4);
+
+    // Two columns when there is room. This loop used to index rows[] BY SCREEN
+    // ROW, so every entry past `visible` was silently never drawn: twenty-eight
+    // entries needed a thirty-two-row terminal before the last one appeared, and
+    // the newest bindings are exactly the ones at the end. Two columns halve the
+    // height needed, and the scroll below covers whatever still does not fit.
+    int cols = (W >= 96 && total > visible) ? 2 : 1;
+    int per_col = (total + cols - 1) / cols;
+    int col_w = (inner - (cols - 1) * 2) / cols;
+    int max_scroll = std::max(0, per_col - visible);
+    cheatsheet_scroll_ = std::clamp(cheatsheet_scroll_, 0, max_scroll);
+
     for (int r = 0; r < visible; ++r) {
-        if (r >= total) { frame << box_line("", W, border) << "\n"; continue; }
-        auto it = settings_.hotkeys.find(rows[r].first);
-        std::string key = (it != settings_.hotkeys.end() && !it->second.empty()) ? it->second : "-";
-        std::string line = pad_right(key, 14) + rows[r].second;
+        std::string line;
+        for (int c = 0; c < cols; ++c) {
+            int row_in_col = r + cheatsheet_scroll_;
+            int idx = c * per_col + row_in_col;
+            std::string cell;
+            if (row_in_col < per_col && idx < total) {
+                auto it = settings_.hotkeys.find(rows[idx].first);
+                std::string key = (it != settings_.hotkeys.end() && !it->second.empty()) ? it->second : "-";
+                // 16, not 14: ARROW_KEY_RIGHT is fifteen characters and used to
+                // run straight into its description with no gap at all.
+                cell = pad_right(truncate_str(key, 15), 16) + rows[idx].second;
+            }
+            if (c) line += "  ";
+            line += pad_right(truncate_str(cell, col_w), col_w);
+        }
         frame << box_line(line, W, border) << "\n";
     }
-    frame << box_bottom(W, "[? / ESC] close", border) << "\n";
+
+    std::string footer = "[? / ESC] close";
+    if (max_scroll > 0) {
+        footer += "   ( " + std::to_string(per_col - visible - cheatsheet_scroll_) + " more, arrows scroll )";
+    }
+    frame << box_bottom(W, footer, border) << "\n";
 }
+
 
 // ---------------------------------------------------------------------
 // Bulk add overlay (paste-a-playlist-link panel, "a" while Queue focused)
@@ -4709,6 +5349,7 @@ std::string App::render_frame(TerminalIO& term) {
             case Mode::Settings: case Mode::ColorEdit: return 1;
             case Mode::Console: return 2;
             case Mode::Cheatsheet: return 3;
+            case Mode::SpotifyLibrary: return 4;
         }
         return 0;
     };
@@ -4744,6 +5385,28 @@ std::string App::render_frame(TerminalIO& term) {
         std::ostringstream frame;
         frame << "\x1b[2J\x1b[H\x1b[?25l";
         build_cheatsheet_screen(frame, W);
+        return clamp_output_rows(frame.str(), term_rows_);
+    }
+
+    if (mode_ == Mode::SpotifyLibrary) {
+        // Sized off term_rows_ like the cheatsheet, NOT off player_view_height().
+        // That helper exists so Console and Settings stand in for the player view
+        // at exactly its height; this stands in for nothing, and capping a browser
+        // at the player height would waste every row a tall terminal offers on the
+        // one view that most wants them.
+        //   -3: the status row, plus the row clamp_output_rows() reserves.
+        //   -4: this overlay top border, header, filter row and bottom border.
+        const int overlay_h = std::max(term_rows_ - 3, 8);
+        lib_body_rows_ = std::max(1, overlay_h - 4);
+        // Both cursors are re-clamped here rather than only on a keypress, so a
+        // terminal resize cannot leave a cursor below the visible window.
+        clamp_cursor_scroll(lib_item_cursor_, lib_item_scroll_,
+                            static_cast<int>(lib_visible_.size()), lib_body_rows_);
+        clamp_cursor_scroll(lib_track_cursor_, lib_track_scroll_,
+                            static_cast<int>(lib_tracks_.size()), lib_body_rows_);
+        std::ostringstream frame;
+        frame << "\x1b[2J\x1b[H\x1b[?25l";
+        build_spotify_library_screen(frame, W);
         return clamp_output_rows(frame.str(), term_rows_);
     }
 
@@ -4929,6 +5592,8 @@ int App::run() {
         poll_pending_load();
         poll_pending_waveform();
         poll_pending_bulk_add();
+        poll_pending_library();
+        poll_pending_library_tracks();
         maybe_autosave();
 
         auto now = std::chrono::steady_clock::now();
@@ -4985,6 +5650,8 @@ int App::run() {
     if (load_thread_.joinable()) load_thread_.join();
     if (search_thread_.joinable()) search_thread_.join();
     if (bulk_add_thread_.joinable()) bulk_add_thread_.join();
+    if (lib_thread_.joinable()) lib_thread_.join();
+    if (lib_tracks_thread_.joinable()) lib_tracks_thread_.join();
     std::cout << "\nbye.\n";
     return 0;
 }

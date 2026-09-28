@@ -262,6 +262,16 @@ private:
     void build_console_screen(std::ostringstream& frame, int W, int target_height) const;
 
     // --- cheatsheet overlay (HKeyCheatsheet) ----------------------------
+    // Scrolls now, and lays out in two columns when there is room. It used to
+    // index its row table BY SCREEN ROW, so every entry past the visible count
+    // was silently not drawn at all -- on a 30-row terminal that was the last
+    // two of twenty-seven.
+    // mutable because build_cheatsheet_screen() is const and clamps this to the
+    // scroll range it just computed from the terminal height and column count.
+    // Writing the clamp back is what stops a held arrow key inflating the
+    // counter so far that scrolling back up takes dozens of presses. Same
+    // precedent as last_lyrics_status_ and the visualiser state above.
+    mutable int cheatsheet_scroll_ = 0;
     void build_cheatsheet_screen(std::ostringstream& frame, int W) const;
 
     // The Console and Settings overlays must always be exactly as tall as
@@ -340,6 +350,105 @@ private:
     void commit_bulk_add(bool all); // all=true -> every fetched track; all=false -> only starred ones
     static constexpr int kBulkAddPanelWidth = 62; // matches the reference design exactly
     std::vector<std::string> build_bulk_add_panel() const; // returns fixed-width, fixed-height lines for draw_floating_panel()
+
+    // --- Spotify library overlay (HKeySpotifyLibrary, 'o') ----------------
+    //
+    // A full-screen mode takeover, like Console/Settings/Cheatsheet and unlike
+    // the floating panels: two panes side by side, the flat library on the left
+    // and the hovered row's tracks on the right.
+    //
+    // Deliberately NOT routed through SpotifyControl. That is a single-worker
+    // FIFO whose ordering is exactly what makes the transport handover gapless
+    // (see the staged librespot comment above for what happens when it is
+    // violated), so parking a paginated library fetch in it would delay a pause
+    // behind three HTTPS round trips. These use the plain background-thread
+    // handoff instead -- launch_bulk_add_async's shape, plus the try/catch(...)
+    // guard that launch_spotify_search_async has and bulk add lacks.
+    enum class LibPane { Items, Tracks };
+
+    struct LibrarySnapshot {
+        bool ok = false;
+        std::string error;
+        SpotifyProfile profile;
+        std::vector<SpotifyLibraryItem> items;  // classified and ordered already
+    };
+
+    LibrarySnapshot library_;        // adopted; main thread only, like every
+                                    // other field in this view model
+    bool library_loaded_ = false;   // session cache validity. Stays false after
+                                    // a failure, so the next 'o' retries.
+    LibPane lib_pane_ = LibPane::Items;
+    int lib_item_cursor_ = 0, lib_item_scroll_ = 0;
+    int lib_track_cursor_ = 0, lib_track_scroll_ = 0;
+    // True while '/' is live: keystrokes go to the buffer, not to the command
+    // switch. Without the flag, typing "add" into a filter would queue a
+    // playlist on the 'a'.
+    bool lib_filtering_ = false;
+    std::string lib_filter_;
+    std::vector<int> lib_visible_;   // indices into library_.items after the filter
+
+    // Per-item track cache, session lifetime, never written to disk. Keyed by
+    // item id. A cached-but-EMPTY vector is a real answer -- an empty playlist,
+    // or one holding only local files -- so "is it cached" is count(), never
+    // empty(), or those two would refetch on every cursor rest.
+    std::unordered_map<std::string, std::vector<OnlineResult>> lib_track_cache_;
+    std::string lib_tracks_key_;              // which id lib_tracks_ mirrors
+    std::vector<OnlineResult> lib_tracks_;    // the right pane's rows
+    // item.tracks minus what came back: the count Spotify reports includes
+    // local files, which the helper drops. Without saying so, a playlist of 37
+    // local files reads as an inexplicably empty pane.
+    int lib_tracks_dropped_ = 0;
+    std::string lib_tracks_error_;            // right-pane-only failure
+
+    // Moving the left cursor does NOT fetch. It stamps this, and the poll starts
+    // the fetch once the cursor has been still for the debounce -- otherwise
+    // holding Down through 141 rows would be 141 Python interpreters and 141
+    // HTTPS round trips.
+    std::chrono::steady_clock::time_point lib_cursor_moved_at_{};
+    static constexpr double kLibTrackDebounceSec = 0.25;
+    // 'a' pressed on an item whose tracks have not arrived yet: remember which,
+    // and queue it when the matching result lands, so the key always works
+    // rather than telling the user to press it again.
+    std::string lib_queue_when_loaded_;
+    // Below this total width two panes leave ~16 inner columns each, which
+    // cannot hold a usable row, so only the focused pane is drawn.
+    static constexpr int kLibraryMinTwoPaneWidth = 72;
+    // How many body rows the panes actually got this frame. Computed in
+    // render_frame (which is non-const) before the const builders run, the
+    // same way list_visible_rows_ is, so the scroll maths and what is drawn
+    // can never disagree.
+    int lib_body_rows_ = 1;
+
+    std::thread lib_thread_;
+    std::mutex lib_mutex_;
+    std::atomic<bool> lib_in_progress_{false};
+    std::atomic<bool> lib_ready_{false};
+    LibrarySnapshot pending_library_;          // guarded by lib_mutex_
+
+    struct LibTracksResult {
+        std::string key;            // the item id this answers for, so a reply
+                                    // for a row the cursor has left is discarded
+        int declared_total = 0;
+        std::string error;
+        std::vector<OnlineResult> items;
+    };
+    std::thread lib_tracks_thread_;
+    std::mutex lib_tracks_mutex_;
+    std::atomic<bool> lib_tracks_in_progress_{false};
+    std::atomic<bool> lib_tracks_ready_{false};
+    LibTracksResult pending_lib_tracks_;       // guarded by lib_tracks_mutex_
+
+    void open_spotify_library();
+    void launch_library_async(bool force_refresh);
+    void poll_pending_library();
+    void launch_library_tracks_async(const SpotifyLibraryItem& item);
+    void poll_pending_library_tracks();
+    void library_refresh_filter();
+    const SpotifyLibraryItem* library_hovered() const;
+    int  library_queue_tracks(const std::vector<OnlineResult>& items);
+    void build_spotify_library_screen(std::ostringstream& frame, int W) const;
+    std::vector<std::string> build_library_items_pane(int total_width, int body_h) const;
+    std::vector<std::string> build_library_tracks_pane(int total_width, int body_h) const;
 
     // --- retry lyrics (HKeyRetryLyrics, 'l') ------------------------------
     // A manual override form: rather than instantly re-fetching with the
