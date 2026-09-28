@@ -1483,7 +1483,7 @@ std::string App::queue_add_selected() {
         title = t.title;
     } else {
         const auto& r = online_view_[selected_];
-        queue_.push_back({false, r.title, r.uploader, {}, r.video_id, r.spotify_uri, r.duration_sec});
+        queue_.push_back(queue_item_from(r));
         title = r.title;
     }
     clamp_queue_selected();
@@ -1744,8 +1744,7 @@ void App::commit_bulk_add(bool all) {
     for (size_t i = 0; i < pending_bulk_add_.items.size(); ++i) {
         if (!all && (i >= bulk_add_selected_.size() || !bulk_add_selected_[i])) continue;
         const auto& item = pending_bulk_add_.items[i];
-        queue_.push_back({false, item.title, item.uploader, {}, item.video_id,
-                          item.spotify_uri, item.duration_sec});
+        queue_.push_back(queue_item_from(item));
         ++added;
     }
     clamp_queue_selected();

@@ -270,6 +270,10 @@ def cmd_status(client_id):
     me = r.json()
     emit({
         "ok": True,
+        # The raw id, separate from "user". display_name is nullable and not
+        # unique, so it cannot decide whether a playlist is the user's own --
+        # only this can. "user" stays exactly as it was for existing callers.
+        "id": me.get("id", ""),
         "user": me.get("display_name") or me.get("id"),
         "product": me.get("product"),          # "premium" / "free"
         "country": me.get("country"),
@@ -293,12 +297,17 @@ def cmd_playlists(client_id):
             # now null and the total lives under "items". Read both so this
             # keeps working whichever shape the API returns.
             count = (p.get("items") or p.get("tracks") or {}).get("total", 0)
+            owner = p.get("owner") or {}
             out.append({
                 "id": p.get("id", ""),
                 "name": p.get("name", ""),
-                "owner": (p.get("owner") or {}).get("display_name", ""),
+                # display_name can be null on a real account; "" is the answer
+                # the caller wants, not None.
+                "owner": owner.get("display_name") or "",
+                "owner_id": owner.get("id", ""),
                 "tracks": count,
                 "uri": p.get("uri", ""),
+                "kind": "playlist",
             })
         nxt = d.get("next")
         url = nxt[len(API):] if nxt and nxt.startswith(API) else None
@@ -313,16 +322,20 @@ def _unwrap(entry):
     return entry.get("item") or entry.get("track")
 
 
-def _track_obj(t):
+def _track_obj(t, album_name=None):
     if not t or t.get("is_local"):
         return None
     artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a)
+    # A *simplified* track -- the shape /albums/{id} nests under "tracks" --
+    # carries no "album" key at all, so the caller supplies the name it already
+    # had. Defaulted, so the three existing call sites stay untouched.
+    album = (t.get("album") or {}).get("name", "") or (album_name or "")
     return {
         "id": t.get("id", ""),
         "uri": t.get("uri", ""),
         "title": t.get("name", ""),
         "artist": artists,
-        "album": (t.get("album") or {}).get("name", ""),
+        "album": album,
         "duration_sec": round((t.get("duration_ms") or 0) / 1000.0, 3),
     }
 
@@ -345,6 +358,74 @@ def cmd_tracks(client_id, playlist_id):
                 out.append(obj)
         nxt = d.get("next")
         url = nxt[len(API):] if nxt and nxt.startswith(API) else None
+    emit({"ok": True, "tracks": out})
+
+
+def cmd_albums(client_id):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    out, url = [], "/me/albums?limit=50"
+    while url:
+        r = api(tok, "GET", url)
+        if r.status_code != 200:
+            emit({"ok": False, "error": "API", "detail": "HTTP %d" % r.status_code})
+        d = r.json()
+        for it in d.get("items", []):
+            a = (it or {}).get("album")
+            if not a:
+                continue
+            # Same defensive read as cmd_playlists: take whichever of
+            # "tracks"/"items" the API is currently putting the total under.
+            count = (a.get("tracks") or a.get("items") or {}).get("total", 0)
+            out.append({
+                "id": a.get("id", ""),
+                "name": a.get("name", ""),
+                # An album has no owning *user*. The artist is the only thing
+                # that belongs in the owner column, and owner_id stays empty so
+                # the "is this mine" comparison can never match an album.
+                "owner": ", ".join(x.get("name", "") for x in (a.get("artists") or []) if x),
+                "owner_id": "",
+                "tracks": count,
+                "uri": a.get("uri", ""),
+                "kind": "album",
+            })
+        nxt = d.get("next")
+        url = nxt[len(API):] if nxt and nxt.startswith(API) else None
+    emit({"ok": True, "albums": out})
+
+
+def cmd_album_tracks(client_id, album_id):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    # /albums/{id} rather than /albums/{id}/tracks: this one response carries
+    # the album's own name AND its first page of tracks, so the common case is
+    # ONE round trip. /albums/{id}/tracks returns simplified track objects with
+    # no album field and gives no way to learn the name, which would have meant
+    # a second request for every album.
+    r = api(tok, "GET", "/albums/%s" % urllib.parse.quote(album_id))
+    if r.status_code != 200:
+        emit({"ok": False, "error": "API", "detail": "HTTP %d" % r.status_code})
+    alb = r.json()
+    album_name = alb.get("name", "")
+    page = alb.get("tracks") or {}
+    out = []
+    while True:
+        for t in page.get("items", []):
+            # No _unwrap() here: a playlist/library ENTRY wraps the track
+            # object, but an album's own track list holds bare track objects.
+            obj = _track_obj(t, album_name)
+            if obj and obj["uri"]:
+                out.append(obj)
+        nxt = page.get("next")
+        url = nxt[len(API):] if nxt and nxt.startswith(API) else None
+        if not url:
+            break
+        r = api(tok, "GET", url)
+        if r.status_code != 200:
+            emit({"ok": False, "error": "API", "detail": "HTTP %d" % r.status_code})
+        page = r.json()
     emit({"ok": True, "tracks": out})
 
 
@@ -642,7 +723,7 @@ def cmd_ensure_librespot(dest=None, url=None, sha256=None):
 def main():
     args = sys.argv[1:]
     if not args:
-        fail("USAGE", "spotify.py <login|status|playlists|tracks|saved|search|devices|state|play|queue|pause|resume|seek|next|transfer|ensure-librespot> ...")
+        fail("USAGE", "spotify.py <login|status|playlists|tracks|albums|album-tracks|saved|search|devices|state|play|queue|pause|resume|seek|next|transfer|ensure-librespot> ...")
 
     client_id = os.environ.get("MOUSIKI_SPOTIFY_CLIENT_ID", "")
     if "--client-id" in args:
@@ -671,6 +752,12 @@ def main():
             if not rest:
                 fail("USAGE", "tracks <playlist_id>")
             cmd_tracks(client_id, rest[0])
+        elif cmd == "albums":
+            cmd_albums(client_id)
+        elif cmd == "album-tracks":
+            if not rest:
+                fail("USAGE", "album-tracks <album_id>")
+            cmd_album_tracks(client_id, rest[0])
         elif cmd == "saved":
             cmd_saved(client_id)
         elif cmd == "search":

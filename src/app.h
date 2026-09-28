@@ -17,6 +17,8 @@
 #include "native_duration.h"
 #include "online_source.h"
 #include "player.h"
+#include "queue_item.h"
+#include "queue_ops.h"
 #include "settings.h"
 #include "snapshot.h"
 #include "librespot_session.h"
@@ -31,22 +33,13 @@
 
 namespace muisc {
 
-enum class Mode { Browse, Search, Settings, ColorEdit, Console, Cheatsheet, BulkAdd, RetryLyrics };
+enum class Mode { Browse, Search, Settings, ColorEdit, Console, Cheatsheet, BulkAdd, RetryLyrics,
+                  SpotifyLibrary };
 enum class ListSource { Local, Online };
 
-struct QueueItem {
-    bool is_local;
-    std::string title;
-    std::string artist;
-    fs::path local_path;   // valid if is_local
-    std::string video_id;  // valid if !is_local
-    // Carried so a queued Spotify track stays a Spotify track. Without these,
-    // enqueuing one dropped its URI and its duration, and replaying it fell
-    // through to the YouTube search path with an empty artist -- a different
-    // recording, silently.
-    std::string spotify_uri;
-    double duration_sec = -1.0;
-};
+// QueueItem now lives in queue_item.h, moved there verbatim (field order
+// included -- see its comment) so queue_ops.h can be a leaf translation unit the
+// unit tests link without dragging in miniaudio through player.h.
 
 class App {
 public:

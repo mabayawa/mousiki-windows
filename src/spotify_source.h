@@ -31,11 +31,45 @@ struct SpotifyPlaybackState {
     int volume_percent = -1;
 };
 
-struct SpotifyPlaylist {
+// One row of the user's library: a playlist they created, a playlist they
+// follow, or a saved album.
+//
+// One struct with a kind tag rather than two near-identical types, because a
+// playlist and an album ARE the same row as far as browsing goes -- a named
+// collection of tracks with an owner and a count -- and the only thing that
+// differs is which helper subcommand fetches the contents.
+struct SpotifyLibraryItem {
+    enum class Kind { Playlist, Album };
     std::string id;
     std::string name;
+    // display_name for a playlist, the joined artist names for an album. CAN be
+    // empty: a real Spotify account can have a null display_name.
     std::string owner;
+    // The owning user's id, and the ONLY reliable answer to "is this mine".
+    // owner alone cannot do it -- display_name is nullable and not unique, so
+    // comparing names would misclassify a followed playlist made by someone
+    // sharing the user's display name. Always empty for an album, which is what
+    // keeps an album from ever being classified as the user's own.
+    std::string owner_id;
+    std::string uri;
     int tracks = 0;
+    Kind kind = Kind::Playlist;
+    // Filled in by build_library_rows() (spotify_library.h), not by the parser:
+    // it is a comparison against the signed-in profile, which the JSON layer
+    // knows nothing about.
+    bool mine = false;
+};
+
+// Flattened /me. `id` is what SpotifyLibraryItem::owner_id is compared against.
+//
+// `product` empty means UNKNOWN, exactly as product() below documents -- not
+// "free". A token minted before user-read-private was requested omits it, and
+// Spotify returns null for it on accounts that do have the scope.
+struct SpotifyProfile {
+    std::string id;
+    std::string display_name;
+    std::string product;
+    std::string country;
 };
 
 // Thin C++ face over scripts/spotify.py.
@@ -69,9 +103,20 @@ public:
     // user approves or it times out. Call from a background thread.
     bool login(std::string* detail = nullptr) const;
 
-    std::vector<SpotifyPlaylist> playlists(std::string* error_out = nullptr) const;
+    // One `status` round trip, flattened. The library browser uses this rather
+    // than product() so opening it costs one /me call, not two.
+    bool profile(SpotifyProfile& out, std::string* error_out = nullptr) const;
+
+    std::vector<SpotifyLibraryItem> playlists(std::string* error_out = nullptr) const;
+    std::vector<SpotifyLibraryItem> saved_albums(std::string* error_out = nullptr) const;
     std::vector<OnlineResult> playlist_tracks(const std::string& playlist_id,
                                               std::string* error_out = nullptr) const;
+    // Reads /albums/{id}, which carries the album name AND its first page of
+    // tracks, so this is one round trip rather than the two that
+    // /albums/{id}/tracks would need (its simplified track objects have no
+    // album field and no way to learn the name).
+    std::vector<OnlineResult> album_tracks(const std::string& album_id,
+                                           std::string* error_out = nullptr) const;
     std::vector<OnlineResult> saved_tracks(std::string* error_out = nullptr) const;
     std::vector<OnlineResult> search(const std::string& query,
                                      std::string* error_out = nullptr) const;
