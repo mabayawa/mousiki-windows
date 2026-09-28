@@ -89,6 +89,7 @@ bool profile(const std::string& text, SpotifyProfile& out, std::string* error_ou
     // playback on it; let a 403 at play time decide.
     if (auto* v = root.find("product")) out.product = v->as_string();
     if (auto* v = root.find("country")) out.country = v->as_string();
+    if (auto* v = root.find("market")) out.market = v->as_string();
     return true;
 }
 

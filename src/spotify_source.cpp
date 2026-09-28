@@ -237,6 +237,11 @@ bool SpotifySource::seek(const std::string& device_id, long long position_ms,
     return call_ok({"seek", std::to_string(position_ms), device_id}, error_out);
 }
 
+bool SpotifySource::set_volume(const std::string& device_id, int percent,
+                               std::string* error_out) const {
+    return call_ok({"volume", std::to_string(percent), device_id}, error_out);
+}
+
 bool SpotifySource::next(const std::string& device_id, std::string* error_out) const {
     return call_ok({"next", device_id}, error_out);
 }

@@ -1201,7 +1201,14 @@ void App::launch_device_play_async() {
     start_device_worker();
     int my_gen = ++device_gen_;
     auto pcm = current_session_ ? current_session_->ring() : nullptr;
-    int vol = player_.volume() > 0 ? player_.volume() : 70;
+    // Was `player_.volume() > 0 ? player_.volume() : 70`, which treated a volume
+    // of ZERO as "unset" and silently restored 70 on every single track start.
+    // Two visible consequences: turning the volume down to 0 undid itself on the
+    // next track, and muting with x came back at 70 % while the UI still showed
+    // muted -- so x then "unmuted" to pre_mute_volume_ from an already-audible
+    // state. volume_pct_ is initialised to 70 by Player itself and restored from
+    // the snapshot, so there was never an unset case for this to guard.
+    int vol = player_.volume();
     // One-shot resume position from a restored snapshot -- consumed
     // here exactly once, then zeroed so every subsequent track change
     // (skip, search-and-play, queue advance, ...) starts at 0 like
@@ -2611,6 +2618,12 @@ bool App::start_spotify_remote(const OnlineResult& r) {
     // Kept: poll_spotify() only polls /me/player eagerly once this has landed,
     // and that poll is the only thing that can confirm the switch.
     switch_play_ticket_ = spotify_ctl_.play(dev, {r.spotify_uri});
+    // Push our volume onto the device as part of starting it. Without this the
+    // device keeps whatever the desktop app was last set to, while the bar on
+    // screen shows mousiki's own number -- so the displayed volume is simply
+    // wrong until the user happens to press a volume key. Queued AFTER the play
+    // so it cannot be dropped as superseded by the pause that play issues.
+    spotify_ctl_.volume(dev, muted_ ? 0 : player_.volume());
     log_event("spotify: playing via " +
               (spotify_device_name_.empty() ? std::string("Spotify") : spotify_device_name_) +
               " -- visualizers unavailable in this mode");
@@ -2627,6 +2640,28 @@ double App::current_elapsed() const {
         return std::max(0.0, pos);
     }
     return player_.poll_elapsed();
+}
+
+// The single place volume changes, because there are two places it has to land.
+//
+// mousiki's own gain only affects audio that passes through Player -- local
+// files, YouTube streams, and Spotify through librespot, which all end up in a
+// PcmRing the data callback multiplies by gain_. In Spotify CONNECT mode there
+// is no ring at all: the desktop app is doing the decoding and the playback, and
+// mousiki never sees a sample. So the gain was being set, the on-screen bar was
+// moving, and absolutely nothing changed about what came out of the speakers.
+//
+// The local gain is still set in both modes. It is what the volume bar reads, so
+// leaving it alone in remote mode would freeze the bar, and it is the value the
+// snapshot persists and that a later local track starts at.
+void App::apply_volume(int percent) {
+    const int pct = std::clamp(percent, 0, 100);
+    player_.set_volume(pct);
+    if (spotify_remote_ && !spotify_device_id_.empty()) {
+        // Coalesced inside SpotifyControl, so holding the key is one round trip
+        // for the value the user settled on rather than one per press.
+        spotify_ctl_.volume(spotify_device_id_, pct);
+    }
 }
 
 void App::poll_spotify() {
@@ -3185,10 +3220,10 @@ void App::handle_key(int key) {
         // never needed a track: set_volume() is a gain store, safe with no ring
         // and no device, and it is what the next play() picks up anyway.
         case '1': // volume up
-            player_.set_volume(std::min(100, player_.volume() + 5));
+            apply_volume(std::min(100, player_.volume() + 5));
             break;
         case '2': // volume down
-            player_.set_volume(std::max(0, player_.volume() - 5));
+            apply_volume(std::max(0, player_.volume() - 5));
             break;
         case 'n': case 'N': // next -- the queue (if any) takes priority,
                              // same as auto-advance-on-finish does, and
@@ -3274,11 +3309,11 @@ void App::handle_key(int key) {
         case 'x': case 'X': // mute -- force volume to 0 without touching pause state
             if (!muted_) {
                 pre_mute_volume_ = player_.volume();
-                player_.set_volume(0);
+                apply_volume(0);
                 muted_ = true;
                 log_event("muted");
             } else {
-                player_.set_volume(pre_mute_volume_);
+                apply_volume(pre_mute_volume_);
                 muted_ = false;
                 log_event("unmuted");
             }
@@ -4071,6 +4106,18 @@ void App::poll_pending_library() {
     log_event(library_.ok
                   ? ("spotify library: " + std::to_string(library_.items.size()) + " items")
                   : ("spotify library: " + library_.error));
+
+    // An empty market means the helper could not learn which country this token
+    // belongs to, which is the ONLY reason tracks unavailable in that country
+    // still appear: Spotify reports is_playable only when a market is supplied.
+    // It is empty for the same reason product is -- the cached token predates
+    // user-read-private -- so one re-authorisation fixes both, and saying so is
+    // more use than silently listing tracks that will not play.
+    if (library_.ok && library_.profile.market.empty()) {
+        status_line_ = "spotify: re-run the helper login to hide unavailable tracks and show your plan";
+        log_event("spotify: no market for this token (needs user-read-private); "
+                  "unavailable tracks cannot be filtered and the plan reads as unknown");
+    }
 }
 
 void App::launch_library_tracks_async(const SpotifyLibraryItem& item) {
@@ -4312,15 +4359,17 @@ std::vector<std::string> App::build_library_tracks_pane(int total_width, int bod
     out.push_back(box_line(head, total_width, border));
 
     // Second header row: why a count and a track list can legitimately disagree.
-    // Spotify counts local files in a playlist total and the helper drops them,
-    // so without saying so a playlist of 37 local files reads as inexplicably
-    // empty.
+    // Spotify counts things in a playlist total that cannot be streamed here --
+    // local files, and tracks unavailable in this market -- and the helper drops
+    // both, so without saying so a playlist of 37 of them reads as inexplicably
+    // empty. Deliberately not split into two numbers: the helper reports one
+    // list and the reason per track is not worth a wider JSON contract.
     std::string note;
     if (!lib_tracks_error_.empty()) {
         note = lib_tracks_error_;
     } else if (showing_hovered && lib_tracks_dropped_ > 0) {
         note = "(" + std::to_string(lib_tracks_dropped_)
-             + (lib_tracks_dropped_ == 1 ? " local file skipped)" : " local files skipped)");
+             + (lib_tracks_dropped_ == 1 ? " track not playable here)" : " tracks not playable here)");
     }
     out.push_back(box_line(note, total_width, border));
 
@@ -4332,7 +4381,7 @@ std::vector<std::string> App::build_library_tracks_pane(int total_width, int bod
         if (!hov) empty_msg = "\u2014";
         else if (!lib_tracks_error_.empty()) empty_msg = "COULD NOT LOAD THOSE TRACKS";
         else if (!showing_hovered) empty_msg = "LOADING ...";
-        else if (lib_tracks_dropped_ > 0) empty_msg = "NO PLAYABLE TRACKS";
+        else if (lib_tracks_dropped_ > 0) empty_msg = "NOTHING HERE IS PLAYABLE";
         else empty_msg = "NO TRACKS";
     }
 

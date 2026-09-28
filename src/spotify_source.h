@@ -70,6 +70,12 @@ struct SpotifyProfile {
     std::string display_name;
     std::string product;
     std::string country;
+    // The market the helper resolved for this token, or empty when it could not.
+    // Empty is why tracks unavailable in the user region cannot be filtered out:
+    // Spotify only reports is_playable when a market is supplied. It is empty for
+    // exactly the same reason product is -- a token minted before
+    // user-read-private was requested reports no country.
+    std::string market;
 };
 
 // Thin C++ face over scripts/spotify.py.
@@ -152,6 +158,11 @@ public:
     bool seek(const std::string& device_id, long long position_ms,
               std::string* error_out = nullptr) const;
     bool next(const std::string& device_id, std::string* error_out = nullptr) const;
+    // Connect-device volume. mousiki's own gain does nothing in remote mode:
+    // the audio never passes through Player at all, so the only way to change
+    // what the user hears is to ask the device.
+    bool set_volume(const std::string& device_id, int percent,
+                    std::string* error_out = nullptr) const;
     bool transfer(const std::string& device_id, bool start_playing,
                   std::string* error_out = nullptr) const;
 

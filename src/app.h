@@ -579,6 +579,9 @@ private:
     OnlineResult pending_spotify_play_;
     bool spotify_play_pending_ = false;
 
+    // Volume has to reach the Connect device too, not just our own gain --
+    // see the comment on the definition.
+    void apply_volume(int percent);
     void poll_spotify();
     void resolve_spotify_play(const OnlineResult& r);
     void spotify_begin(const OnlineResult& r);

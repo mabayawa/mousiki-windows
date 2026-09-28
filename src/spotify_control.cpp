@@ -65,6 +65,40 @@ SpotifyControl::Ticket SpotifyControl::submit(Cmd c) {
     return t;
 }
 
+SpotifyControl::Ticket SpotifyControl::volume(const std::string& device_id, int percent) {
+    if (!src_) return 0;
+    ensure_worker();
+    Ticket t = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (quit_) return 0;
+        // Replace any volume still waiting. Holding a volume key otherwise
+        // queues one round trip per press and the device audibly climbs through
+        // every step on the way, seconds behind the bar on screen.
+        Ticket dropped_hi = 0;
+        for (auto it = queue_.begin(); it != queue_.end();) {
+            if (it->kind == Cmd::Kind::Volume) {
+                dropped_hi = (std::max)(dropped_hi, it->ticket);
+                pending_.fetch_sub(1, std::memory_order_relaxed);
+                it = queue_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Dropped means it will never run, so nothing may wait on it forever.
+        // Every dropped ticket is older than the one issued just below.
+        if (dropped_hi) note_completed(dropped_hi);
+
+        t = ++next_ticket_;
+        Cmd c{Cmd::Kind::Volume, device_id, {}, -1, t};
+        c.percent = percent;
+        queue_.push_back(std::move(c));
+        pending_.fetch_add(1, std::memory_order_relaxed);
+    }
+    cv_.notify_one();
+    return t;
+}
+
 SpotifyControl::Ticket SpotifyControl::pause_now(const std::string& device_id) {
     if (!src_) return 0;
     ensure_worker();
@@ -169,6 +203,7 @@ void SpotifyControl::worker_loop() {
             case Cmd::Kind::Resume: ok = src_->resume(c.device_id, &err); break;
             case Cmd::Kind::Seek:   ok = src_->seek(c.device_id, c.position_ms, &err); break;
             case Cmd::Kind::Next:   ok = src_->next(c.device_id, &err);   break;
+            case Cmd::Kind::Volume: ok = src_->set_volume(c.device_id, c.percent, &err); break;
             case Cmd::Kind::Devices: {
                 auto devs = src_->devices(&err);
                 ok = err.empty();

@@ -58,6 +58,22 @@ TEST(profile_null_product_reads_as_unknown_not_free) {
     CHECK_EQ(p.id, std::string("bono"));
 }
 
+TEST(profile_market_is_read_and_may_be_empty) {
+    // An empty market is the reason unavailable tracks cannot be filtered:
+    // Spotify reports is_playable only when a market is supplied, and a token
+    // minted before user-read-private resolves no country at all. The app shows
+    // a hint when this is empty, so reading it correctly matters.
+    SpotifyProfile p;
+    std::string err;
+    CHECK(spotify_parse::profile(fixture("me.json"), p, &err));
+    CHECK_EQ(p.market, std::string("PH"));
+
+    SpotifyProfile q;
+    CHECK(spotify_parse::profile(fixture("me_no_product.json"), q, &err));
+    CHECK_EQ(q.market, std::string(""));
+    CHECK_EQ(q.product, std::string(""));   // the same cause, both empty
+}
+
 TEST(profile_fails_on_error_envelope) {
     SpotifyProfile p;
     std::string err;

@@ -277,6 +277,10 @@ def cmd_status(client_id):
         "user": me.get("display_name") or me.get("id"),
         "product": me.get("product"),          # "premium" / "free"
         "country": me.get("country"),
+        # The resolved market, "" when this token cannot tell us one. The app
+        # shows a hint when it is empty, because an empty market is exactly why
+        # tracks unavailable in the user region cannot be filtered out.
+        "market": user_market(tok),
     })
 
 
@@ -325,6 +329,12 @@ def _unwrap(entry):
 def _track_obj(t, album_name=None):
     if not t or t.get("is_local"):
         return None
+    # Unplayable in this market. Present ONLY when the request supplied a market
+    # (see user_market above); `is False` rather than a falsy test on purpose, so
+    # an absent field still counts as playable and nothing is dropped when the
+    # market could not be resolved.
+    if t.get("is_playable") is False:
+        return None
     artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a)
     # A *simplified* track -- the shape /albums/{id} nests under "tracks" --
     # carries no "album" key at all, so the caller supplies the name it already
@@ -346,7 +356,7 @@ def cmd_tracks(client_id, playlist_id):
         emit({"ok": False, "error": "NO_AUTH", "detail": err})
     out = []
     # /tracks returns 403 Forbidden now -- the endpoint was renamed to /items.
-    url = "/playlists/%s/items?limit=100" % urllib.parse.quote(playlist_id)
+    url = "/playlists/%s/items?limit=100%s" % (urllib.parse.quote(playlist_id), market_q(tok))
     while url:
         r = api(tok, "GET", url)
         if r.status_code != 200:
@@ -404,7 +414,7 @@ def cmd_album_tracks(client_id, album_id):
     # ONE round trip. /albums/{id}/tracks returns simplified track objects with
     # no album field and gives no way to learn the name, which would have meant
     # a second request for every album.
-    r = api(tok, "GET", "/albums/%s" % urllib.parse.quote(album_id))
+    r = api(tok, "GET", "/albums/%s%s" % (urllib.parse.quote(album_id), market_q(tok, first=True)))
     if r.status_code != 200:
         emit({"ok": False, "error": "API", "detail": "HTTP %d" % r.status_code})
     alb = r.json()
@@ -433,7 +443,7 @@ def cmd_saved(client_id):
     tok, err = access_token(client_id)
     if not tok:
         emit({"ok": False, "error": "NO_AUTH", "detail": err})
-    out, url = [], "/me/tracks?limit=50"
+    out, url = [], "/me/tracks?limit=50" + market_q(tok)
     while url:
         r = api(tok, "GET", url)
         if r.status_code != 200:
@@ -448,6 +458,50 @@ def cmd_saved(client_id):
     emit({"ok": True, "tracks": out})
 
 
+# Every track-returning endpoint is asked for a MARKET where one is known,
+# because Spotify only populates "is_playable" when one is supplied. Without it
+# the API returns tracks that cannot be played in the user region, they show up
+# in the list, and selecting one plays nothing at all. Supplying a market also
+# enables track RELINKING, so it recovers playable equivalents as well as hiding
+# dead entries.
+#
+# NOT "from_token", which needs the token to resolve to a market and returns
+# HTTP 403 on /search when it cannot -- a token minted before user-read-private
+# was requested reports a null country and cannot. An explicit ISO code is used
+# instead, and when even that is unknown the parameter is OMITTED rather than
+# guessed: no filtering is strictly better than every request failing.
+def user_market(tok):
+    """ISO country for this token, or "" when the token cannot tell us.
+
+    Cached in the token file. /me would otherwise be an extra round trip in
+    every single subcommand, and the answer does not change for an account. An
+    empty string is a real cached answer and is not re-probed; a fresh login
+    writes a new file with no cached market, which is what lets re-authorising
+    with user-read-private start the filtering working.
+    """
+    cached = load_tokens() or {}
+    if "market" in cached:
+        return cached.get("market") or ""
+    market = ""
+    try:
+        r = api(tok, "GET", "/me")
+        if r.status_code == 200:
+            market = r.json().get("country") or ""
+    except requests.RequestException:
+        return ""           # do not cache a network failure as "no market"
+    cached["market"] = market
+    save_tokens(cached)
+    return market
+
+
+def market_q(tok, first=False):
+    """"&market=XX" for appending to a query string, or "" when unknown."""
+    m = user_market(tok)
+    if not m:
+        return ""
+    return ("?" if first else "&") + "market=" + m
+
+
 # Spotify caps /search at 10 results per request. limit=20 and limit=50 are
 # both rejected outright with "Invalid limit", despite paging limits of 50-100
 # elsewhere in the API.
@@ -459,7 +513,7 @@ def cmd_search(client_id, query, limit=SEARCH_LIMIT):
     if not tok:
         emit({"ok": False, "error": "NO_AUTH", "detail": err})
     r = api(tok, "GET", "/search?" + urllib.parse.urlencode(
-        {"q": query, "type": "track", "limit": min(limit, SEARCH_LIMIT)}))
+        {"q": query, "type": "track", "limit": min(limit, SEARCH_LIMIT)}) + market_q(tok))
     if r.status_code != 200:
         emit({"ok": False, "error": "API", "detail": "HTTP %d" % r.status_code})
     items = ((r.json().get("tracks") or {}).get("items") or [])
@@ -569,6 +623,19 @@ def cmd_seek(client_id, device_id, position_ms):
     if device_id:
         q["device_id"] = device_id
     _player_result(api(tok, "PUT", "/me/player/seek?" + urllib.parse.urlencode(q)), "seeked")
+
+
+def cmd_volume(client_id, device_id, percent):
+    tok, err = access_token(client_id)
+    if not tok:
+        emit({"ok": False, "error": "NO_AUTH", "detail": err})
+    # Spotify rejects anything outside 0-100 outright, and mousiki clamps its own
+    # gain the same way, so clamp rather than forward a value the API will reject.
+    pct = max(0, min(100, int(percent)))
+    q = {"volume_percent": pct}
+    if device_id:
+        q["device_id"] = device_id
+    _player_result(api(tok, "PUT", "/me/player/volume?" + urllib.parse.urlencode(q)), "volume set")
 
 
 def cmd_next(client_id, device_id):
@@ -723,7 +790,7 @@ def cmd_ensure_librespot(dest=None, url=None, sha256=None):
 def main():
     args = sys.argv[1:]
     if not args:
-        fail("USAGE", "spotify.py <login|status|playlists|tracks|albums|album-tracks|saved|search|devices|state|play|queue|pause|resume|seek|next|transfer|ensure-librespot> ...")
+        fail("USAGE", "spotify.py <login|status|playlists|tracks|albums|album-tracks|saved|search|devices|state|play|queue|pause|resume|seek|next|volume|transfer|ensure-librespot> ...")
 
     client_id = os.environ.get("MOUSIKI_SPOTIFY_CLIENT_ID", "")
     if "--client-id" in args:
@@ -791,6 +858,10 @@ def main():
             if not rest:
                 fail("USAGE", "seek <position_ms> [device_id]")
             cmd_seek(client_id, rest[1] if len(rest) > 1 else "", rest[0])
+        elif cmd == "volume":
+            if not rest:
+                fail("USAGE", "volume <percent> [device_id]")
+            cmd_volume(client_id, rest[1] if len(rest) > 1 else "", rest[0])
         elif cmd == "next":
             cmd_next(client_id, rest[0] if rest else "")
         elif cmd == "transfer":

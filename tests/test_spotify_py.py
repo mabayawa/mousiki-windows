@@ -40,13 +40,25 @@ class HelperTest(unittest.TestCase):
     def setUp(self):
         self._real_token = spotify.access_token
         self._real_api = spotify.api
+        self._real_load = spotify.load_tokens
+        self._real_save = spotify.save_tokens
         spotify.access_token = lambda client_id: ("fake-token", None)
+        # The token cache is faked, not merely read: user_market() consults it
+        # and WRITES the resolved market back, so an unfaked test would read and
+        # rewrite the real credential file in the user profile. Default to a
+        # known market so the market parameter is present unless a test says
+        # otherwise.
+        self.token_file = {"access_token": "fake-token", "market": "PH"}
+        spotify.load_tokens = lambda: dict(self.token_file)
+        spotify.save_tokens = lambda tok: self.token_file.update(tok)
         self.pages = {}
         self.requested = []
 
     def tearDown(self):
         spotify.access_token = self._real_token
         spotify.api = self._real_api
+        spotify.load_tokens = self._real_load
+        spotify.save_tokens = self._real_save
 
     def serve(self, pages, status=200):
         """pages maps an API path to the payload returned for it."""
@@ -184,7 +196,7 @@ class TestAlbums(HelperTest):
 class TestAlbumTracks(HelperTest):
     def test_fills_the_album_name_into_simplified_tracks(self):
         # /albums/{id} track objects are SIMPLIFIED: no album field at all.
-        self.serve({"/albums/a1": {
+        self.serve({"/albums/a1?market=PH": {
             "name": "In Rainbows",
             "tracks": {"items": [{"id": "t1", "uri": "spotify:track:t1", "name": "Nude",
                                   "artists": [{"name": "Radiohead"}],
@@ -199,7 +211,7 @@ class TestAlbumTracks(HelperTest):
     def test_follows_the_nested_next(self):
         api = spotify.API
         self.serve({
-            "/albums/a1": {"name": "Alb", "tracks": {
+            "/albums/a1?market=PH": {"name": "Alb", "tracks": {
                 "items": [{"id": "t1", "uri": "u1", "name": "one",
                            "artists": [], "duration_ms": 1000}],
                 "next": api + "/albums/a1/tracks?offset=50"}},
@@ -215,9 +227,9 @@ class TestAlbumTracks(HelperTest):
     def test_uses_one_request_for_a_short_album(self):
         # The whole reason for reading /albums/{id} instead of
         # /albums/{id}/tracks: the name and the first page arrive together.
-        self.serve({"/albums/a1": {"name": "Alb", "tracks": {"items": [], "next": None}}})
+        self.serve({"/albums/a1?market=PH": {"name": "Alb", "tracks": {"items": [], "next": None}}})
         self.run_cmd(spotify.cmd_album_tracks, "a1")
-        self.assertEqual(self.requested, ["/albums/a1"])
+        self.assertEqual(self.requested, ["/albums/a1?market=PH"])
 
 
 class TestTrackObject(unittest.TestCase):
@@ -252,7 +264,7 @@ class TestErrorEnvelope(HelperTest):
         self.assertEqual(obj["error"], "API")
 
     def test_album_tracks_reports_the_same_way(self):
-        self.serve({"/albums/a1": {}}, status=404)
+        self.serve({"/albums/a1?market=PH": {}}, status=404)
         obj, _ = self.run_cmd(spotify.cmd_album_tracks, "a1")
         self.assertFalse(obj["ok"])
 
@@ -264,13 +276,88 @@ class TestEnsureAsciiFalse(HelperTest):
         # contract from the PRODUCING side; the C++ suite asserts it from the
         # reading side.
         cjk = "\u96fb\u5149\u77f3\u706b"
-        self.serve({"/albums/a1": {"name": "strobo", "tracks": {
+        self.serve({"/albums/a1?market=PH": {"name": "strobo", "tracks": {
             "items": [{"id": "t1", "uri": "u1", "name": cjk,
                        "artists": [], "duration_ms": 1000}], "next": None}}})
         obj, raw = self.run_cmd(spotify.cmd_album_tracks, "a1")
         self.assertEqual(obj["tracks"][0]["title"], cjk)
         self.assertIn(cjk, raw)
         self.assertNotIn("u96fb", raw)
+
+
+class TestMarket(HelperTest):
+    """Supplying a market is what makes is_playable exist at all."""
+
+    def test_market_is_appended_when_known(self):
+        self.serve({"/me/tracks?limit=50&market=PH": {"items": [], "next": None}})
+        self.run_cmd(spotify.cmd_saved)
+        self.assertEqual(self.requested, ["/me/tracks?limit=50&market=PH"])
+
+    def test_market_is_omitted_when_the_token_cannot_resolve_one(self):
+        # A token minted before user-read-private reports a null country.
+        # Sending market=from_token in that state makes /search return HTTP 403,
+        # so the parameter has to be left off entirely rather than guessed.
+        self.token_file = {"access_token": "fake-token", "market": ""}
+        self.serve({"/me/tracks?limit=50": {"items": [], "next": None}})
+        self.run_cmd(spotify.cmd_saved)
+        self.assertEqual(self.requested, ["/me/tracks?limit=50"])
+
+    def test_an_unknown_market_is_probed_once_then_cached(self):
+        del self.token_file["market"]
+        self.serve({"/me": {"country": "PH"},
+                    "/me/tracks?limit=50&market=PH": {"items": [], "next": None}})
+        self.run_cmd(spotify.cmd_saved)
+        self.assertEqual(self.requested, ["/me", "/me/tracks?limit=50&market=PH"])
+        self.assertEqual(self.token_file["market"], "PH")
+
+    def test_an_empty_probe_result_is_cached_so_it_is_not_re_probed(self):
+        del self.token_file["market"]
+        self.serve({"/me": {"country": None},
+                    "/me/tracks?limit=50": {"items": [], "next": None}})
+        self.run_cmd(spotify.cmd_saved)
+        self.assertEqual(self.token_file["market"], "")
+
+    def test_search_carries_the_market_after_the_encoded_query(self):
+        self.serve({"/search?q=x&type=track&limit=10&market=PH":
+                    {"tracks": {"items": []}}})
+        self.run_cmd(spotify.cmd_search, "x")
+        self.assertEqual(self.requested, ["/search?q=x&type=track&limit=10&market=PH"])
+
+    def test_status_reports_the_market(self):
+        self.serve({"/me": {"display_name": "B", "id": "u1",
+                            "product": None, "country": None}})
+        obj, _ = self.run_cmd(spotify.cmd_status)
+        self.assertEqual(obj["market"], "PH")   # from the cache, no second probe
+
+
+class TestUnplayableTracks(HelperTest):
+    def test_a_track_unplayable_in_this_market_is_dropped(self):
+        self.serve({"/albums/a1?market=PH": {"name": "Alb", "tracks": {"items": [
+            {"id": "t1", "uri": "u1", "name": "playable",
+             "artists": [], "duration_ms": 1000, "is_playable": True},
+            {"id": "t2", "uri": "u2", "name": "greyed out",
+             "artists": [], "duration_ms": 1000, "is_playable": False,
+             "restrictions": {"reason": "market"}},
+        ], "next": None}}})
+        obj, _ = self.run_cmd(spotify.cmd_album_tracks, "a1")
+        self.assertEqual([t["uri"] for t in obj["tracks"]], ["u1"])
+
+    def test_an_absent_is_playable_is_treated_as_playable(self):
+        # The field only exists when a market was supplied. Dropping on absence
+        # would empty every list the moment the market could not be resolved.
+        self.token_file = {"access_token": "fake-token", "market": ""}
+        self.serve({"/albums/a1": {"name": "Alb", "tracks": {"items": [
+            {"id": "t1", "uri": "u1", "name": "no field",
+             "artists": [], "duration_ms": 1000},
+        ], "next": None}}})
+        obj, _ = self.run_cmd(spotify.cmd_album_tracks, "a1")
+        self.assertEqual(len(obj["tracks"]), 1)
+
+    def test_track_obj_drops_unplayable_directly(self):
+        self.assertIsNone(spotify._track_obj(
+            {"uri": "u", "name": "n", "artists": [], "is_playable": False}))
+        self.assertIsNotNone(spotify._track_obj(
+            {"uri": "u", "name": "n", "artists": [], "is_playable": True}))
 
 
 if __name__ == "__main__":

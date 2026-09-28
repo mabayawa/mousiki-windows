@@ -46,6 +46,11 @@ public:
     Ticket resume(const std::string& device_id);
     Ticket seek(const std::string& device_id, long long position_ms);
     Ticket next(const std::string& device_id);
+    // Coalesced: a queued volume is REPLACED rather than appended, so holding a
+    // volume key does not spend one HTTPS round trip per keypress and then walk
+    // the device up through every intermediate value. Only the newest one is
+    // ever sent, which is the only one the user meant.
+    Ticket volume(const std::string& device_id, int percent);
 
     // --- the one command that may overtake the queue ----------------------
     //
@@ -94,11 +99,14 @@ public:
 
 private:
     struct Cmd {
-        enum class Kind { Play, Queue, Pause, Resume, Seek, Next, Devices, State } kind;
+        enum class Kind { Play, Queue, Pause, Resume, Seek, Next, Volume, Devices, State } kind;
         std::string device_id;
         std::vector<std::string> uris;
         long long position_ms = -1;
         Ticket ticket = 0;
+        // Last, so the positional braced initialisers above (pause_now) keep
+        // meaning what they say.
+        int percent = 0;
     };
 
     // What a priority pause supersedes. Pause itself is deliberately NOT in
@@ -111,6 +119,8 @@ private:
         return k == Cmd::Kind::Play || k == Cmd::Kind::Queue || k == Cmd::Kind::Resume ||
                k == Cmd::Kind::Seek || k == Cmd::Kind::Next;
     }
+    // Volume is deliberately NOT in that set: a volume change the user made
+    // before skipping is still the volume they want on the next track.
 
     void ensure_worker();
     void worker_loop();

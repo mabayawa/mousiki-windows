@@ -101,7 +101,7 @@ Configurable in `%USERPROFILE%\.config\mousiki\config.txt`.
 | **Play / Pause** | `p` (or `ENTER`) | Toggle playback |
 | **Next / Previous Track** | `n` / `b` | Skip between songs |
 | **Seek** | `ARROW_LEFT` / `ARROW_RIGHT` | Seek backward / forward |
-| **Volume** | `1` / `2` | Decrease / Increase volume |
+| **Volume** | `1` / `2` | Increase / decrease volume — also sets the Spotify Connect device volume when playing that way |
 | **Shuffle / Repeat** | `m` / `r` | Toggle shuffle or repeat mode |
 
 ### Navigation & Queue
@@ -160,8 +160,13 @@ moment, so holding `ARROW_DOWN` through a large library costs one request rather
 than one per row. Nothing is written to disk.
 
 A playlist can show a track count larger than the list beneath it. Spotify counts
-local files in that total and mousiki cannot stream them, so they are dropped and
-the pane says how many were skipped. Below 72 columns only the focused pane is
+things in that total that cannot be streamed here — local files, and tracks
+unavailable in your country — so they are dropped and the pane says how many.
+Hiding the unavailable ones needs a market, which mousiki reads from your
+account; if your saved login predates the `user-read-private` scope it has no
+market to report, the browser says so once on opening, and re-running
+`python scripts\spotify.py --client-id <your id> login` fixes it (and replaces
+"plan unknown" with your real plan). Below 72 columns only the focused pane is
 drawn, at full width, and `TAB` switches between the two views instead.
 
 Needs `SpotifyClientId` in `config.txt`, the same as `/sp:` search — see
@@ -271,8 +276,8 @@ you searched for:
 The Spotify reads are exactly that: reads. Nothing is written to your Spotify
 account, no playlist is created or modified, and the queue you build lives only
 in mousiki. The only write the app ever makes is to the playback transport of a
-device you already own (play, pause, seek, next), and the one-track lookahead
-that makes the handover gapless.
+device you already own (play, pause, seek, next, volume), and the one-track
+lookahead that makes the handover gapless.
 
 No telemetry, no analytics, no phone-home, no credential or environment
 harvesting. Files are written only under `%USERPROFILE%\.config\mousiki`,
