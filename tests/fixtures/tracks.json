@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "tracks": [
+    {
+      "id": "t1",
+      "uri": "spotify:track:t1",
+      "title": "Midnight City",
+      "artist": "M83",
+      "album": "Hurry Up",
+      "duration_sec": 243.0
+    },
+    {
+      "id": "t2",
+      "uri": "spotify:track:t2",
+      "title": "電光石火",
+      "artist": "Vaundy",
+      "album": "strobo",
+      "duration_sec": 192.5
+    },
+    {
+      "id": "t3",
+      "uri": "",
+      "title": "ghost",
+      "artist": "nobody",
+      "album": "",
+      "duration_sec": 100.0
+    },
+    {
+      "id": "t4",
+      "uri": "spotify:track:t4",
+      "title": "unknown length",
+      "artist": "Someone",
+      "album": "",
+      "duration_sec": -1.0
+    }
+  ]
+}

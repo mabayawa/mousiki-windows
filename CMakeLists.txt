@@ -170,3 +170,71 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/scripts/"
         FILES_MATCHING PATTERN "*.py")
 
 message(STATUS "mousiki: building for ${CMAKE_SYSTEM_NAME}")
+
+# ---------------------------------------------------------------------------
+# Tests
+#
+# A SEPARATE target with an EXPLICIT source list, deliberately not globbed.
+# src/*.cpp is GLOB_RECURSEd into `mousiki` above, so a test file placed in src/
+# would be linked into the application itself and its main() would collide with
+# src/main.cpp. Keeping the tests in tests/ and naming their src/ dependencies
+# one by one is what keeps the two targets from contaminating each other.
+#
+# Only leaf translation units are linked -- nothing that reaches miniaudio,
+# kissfft or an audio backend -- so this compiles in a couple of seconds
+# wherever the app compiles. That is why it defaults to ON: the CI legs run a
+# bare `cmake --build`, which makes the tests a compile gate on all three
+# platforms without any workflow changes.
+#
+# There is no test framework dependency, vendored or fetched. tests/tiny_test.h
+# is ~70 hand-rolled lines, for the same reason src/tiny_json.h is hand-rolled:
+# this tree writes or pins its dependencies, and a framework would be the first
+# unpinned configure-time download in the build.
+# ---------------------------------------------------------------------------
+option(MOUSIKI_BUILD_TESTS "Build the unit tests" ON)
+if(MOUSIKI_BUILD_TESTS)
+    enable_testing()
+    set(MOUSIKI_TEST_SOURCES
+        tests/test_main.cpp
+        tests/test_spotify_parse.cpp
+        tests/test_library_rows.cpp
+        tests/test_queue_ops.cpp
+        tests/test_library_view.cpp
+        src/spotify_parse.cpp
+        src/spotify_library.cpp
+        src/queue_ops.cpp
+        src/library_view.cpp
+        src/terminal_ui.cpp      # pad_right/truncate_str/display_width live here
+        src/indic_handler.cpp)   # ... and display_width calls into this
+    if(WIN32)
+        # win_codepoint_width, for the double-width tests. The file is already
+        # _WIN32-guarded and self-contained; TerminalIO is simply never
+        # constructed, so none of the console setup runs.
+        list(APPEND MOUSIKI_TEST_SOURCES src/win_compat.cpp)
+    endif()
+
+    add_executable(mousiki_tests ${MOUSIKI_TEST_SOURCES})
+    target_include_directories(mousiki_tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/tests")
+    # Absolute and baked in at configure time: a test must not depend on the
+    # working directory ctest happens to launch it from.
+    target_compile_definitions(mousiki_tests PRIVATE
+        MOUSIKI_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+    target_link_libraries(mousiki_tests PRIVATE Threads::Threads)
+
+    if(WIN32)
+        target_compile_definitions(mousiki_tests PRIVATE
+            MUISC_PLATFORM_WINDOWS=1
+            _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000000
+            NOMINMAX WIN32_LEAN_AND_MEAN
+            _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+        target_link_libraries(mousiki_tests PRIVATE ole32 winmm shell32 uuid)
+    endif()
+    if(MSVC)
+        # /utf-8 for the same reason the app needs it: the fixtures and the
+        # expected strings beside them are raw UTF-8 in the source.
+        target_compile_options(mousiki_tests PRIVATE /utf-8 /EHsc /W3)
+    endif()
+
+    add_test(NAME unit COMMAND mousiki_tests)
+endif()
