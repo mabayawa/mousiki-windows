@@ -298,6 +298,7 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyPlay",                        "ENTER"},
             {"HKeySearch",                      "/"},
             {"HKeySearchOnline",                "/s:"},
+            {"HKeySearchSpotify",               "/sp:"},
             {"HKeyPlayNextSong",                "n"},
             {"HKeyPlayPreviousSong",            "b"},
             {"HKeySeekForward",                 "ARROW_KEY_RIGHT"},
@@ -306,6 +307,7 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyDecreaseVolume",              "2"},
             {"HKeyAddHoveringSongToQueue",      "a"},
             {"HKeyRemoveHoveringSongFromQueue", "d"},
+            {"HKeyBulkAddPlaylist",             "g"},
             {"HKeySwitchBetweenCards",          "TAB"},
             {"HKeyTogglePlayPause",             "p"},
             {"HKeyCyclePlayMode",               "m"},
@@ -319,6 +321,7 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyToggleMute",                  "x"},
             {"HKeyCheatsheet",                  "?"},
             {"HKeyRetryLyrics",                 "l"},
+            {"HKeySpotifyLibrary",              "o"},
         };
         for (const auto& [action, key] : defaults) {
             // Only fill actions that are entirely absent from the config.
@@ -658,6 +661,25 @@ static Settings load_from_config(const fs::path& path) {
         if (key == "AutoSaveC1") { if (!unquote(value).empty()) s.autosave_c1 = normalize_color_value(unquote(value)); continue; }
         if (key == "AutoSaveC2") { if (!unquote(value).empty()) s.autosave_c2 = normalize_color_value(unquote(value)); continue; }
 
+        // --- Spotify ---
+        if (key == "SpotifyClientId" || key == "spotify_client_id") {
+            s.spotify_client_id = trim(unquote(value));
+            continue;
+        }
+        if (key == "SpotifyLibrespotPath" || key == "spotify_librespot_path") {
+            std::string p = trim(unquote(value));
+            if (!p.empty() && p[0] == '~') {
+                const char* home = std::getenv("HOME");
+                if (home) p = std::string(home) + p.substr(1);
+            }
+            s.spotify_librespot_path = p;
+            continue;
+        }
+        if (key == "SpotifyPrefetch" || key == "spotify_prefetch") {
+            s.spotify_prefetch = parse_bool(value);
+            continue;
+        }
+
         // --- Local music library paths ---
         // Each LocalMusicPath= line appends one directory.
         // A leading ~ is expanded to $HOME so users can write:
@@ -895,6 +917,13 @@ void save_settings(const Settings& s) {
         std::string setting_key = s.hotkeys.count("HKeySetting") ? s.hotkeys.at("HKeySetting") : "s";
         out << "HKeySetting=\"" << setting_key << "\"\n";
     }
+    // Written back explicitly. save_settings() runs on every clean quit and
+    // only persists the keys it knows about, so anything omitted here is
+    // silently deleted from the user's config the first time they exit.
+    out << "\n# Spotify\n";
+    out << "SpotifyClientId=" << s.spotify_client_id << "\n";
+    out << "SpotifyLibrespotPath=" << s.spotify_librespot_path << "\n";
+    out << "SpotifyPrefetch=" << (s.spotify_prefetch ? "1" : "0") << "\n";
     out << "\n# Local Music Paths\n";
     for (const auto& path : s.local_music_paths) {
         out << "LocalMusicPath=" << path << "\n";
@@ -904,8 +933,10 @@ void save_settings(const Settings& s) {
     static const char* hkey_order[] = {
         "HKeyNavigateUp", "HKeyNavigateDown", "HKeyPlay", "HKeyPlayNextSong", "HKeyPlayPreviousSong",
         "HKeyTogglePlayPause", "HKeyCyclePlayMode", "HKeySearch", "HKeySearchOnline",
+        "HKeySearchSpotify", "HKeySpotifyLibrary",
         "HKeySeekForward", "HKeySeekBackward", "HKeyIncreaseVolume", "HKeyDecreaseVolume",
-        "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeySwitchBetweenCards",
+        "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeyBulkAddPlaylist",
+        "HKeySwitchBetweenCards",
         "HKeyFilterForFolder", "HKeyClearFilter", "HKeyQuit", "HKeyResetPreference", "HKeyDownloadStream",
     };
     for (const char* name : hkey_order) {

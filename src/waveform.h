@@ -3,7 +3,7 @@
 #include <functional>
 #include <string>
 #include <vector>
-#include "streaming_pcm.h"
+#include "envelope_accumulator.h"
 
 namespace muisc {
 
@@ -34,6 +34,15 @@ public:
     static std::vector<float> generate_high_res_envelope(const std::vector<float>& pcm_data,
                                                            int resolution = 4096, bool smooth = true);
 
+    // Same output as the above, from an EnvelopeAccumulator's raw bins instead
+    // of resident PCM. This is the form the streaming path uses: once audio is
+    // held in a bounded ring rather than a whole-track buffer, the samples a
+    // resize would need to re-bin are long gone, but the 48 KiB of raw bins
+    // are still here and reproduce the envelope exactly -- for any `smooth`
+    // setting, at any terminal width.
+    static std::vector<float> envelope_from_bins(const std::vector<EnvelopeBin>& bins,
+                                                  bool smooth = true);
+
     // "Frontend" pass — cheap enough to run every frame (or at least on
     // every resize): resamples the fixed high-res envelope down to
     // whatever the terminal's CURRENT width actually is via peak
@@ -46,21 +55,8 @@ public:
     static std::vector<int> resample_for_ui(const std::vector<float>& high_res_model, int terminal_width);
 };
 
-// Decodes into `pcm` as data becomes available, instead of buffering the
-// whole file before returning — this is what lets playback start after
-// the first chunk instead of waiting for the entire track. Two paths,
-// tried in order:
-//   1. miniaudio's own built-in decoder, entirely in-process (no
-//      subprocess at all) — covers WAV/MP3/FLAC/OGG. This is the primary
-//      path and matches a known-working reference implementation.
-//   2. ffmpeg via subprocess, for anything the above can't open — Opus
-//      (yt-dlp's cache format) being the main real-world case.
-// Runs on the calling thread until done; callers run this on its own
-// background thread. Sets decode_done (and decode_failed on error) on
-// `pcm` when finished. `on_chunk`, if given, is called after each chunk
-// with the chunk that was just produced — used to feed the live FFT
-// visualizer without it needing to touch `pcm` directly.
-void stream_decode_ffmpeg(const fs::path& file_path, StreamingPcm& pcm,
-                           const std::function<void(const float*, size_t)>& on_chunk = nullptr);
+// The streaming decoders that used to live here now belong to DecodeSession
+// (src/decode_session.h), which owns the threads, the cancellation and the
+// seek-restart they need. This header is back to being purely a quantizer.
 
 } // namespace muisc

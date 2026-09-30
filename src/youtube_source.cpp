@@ -1,4 +1,5 @@
 #include "youtube_source.h"
+#include "path_utf8.h"
 #include "process_util.h"
 #include <sstream>
 
@@ -7,10 +8,16 @@ namespace muisc {
 // yt-dlp --print "%(title)s\t%(artist,uploader)s" "ytsearch1:QUERY"
 // gives us a title before we commit to a deterministic cache filename.
 static bool probe_title(const std::string& query, std::string& id, std::string& title, std::string& artist) {
-    std::string cmd = "yt-dlp -4 --no-warnings --extractor-args \"youtube:player_client=android;player_skip=webpage,configs,js\" --match-filters \"categories *= 'Music' & duration >= 90\" --flat-playlist "
-                       "--print \"%(id)s\t%(title)s\t%(uploader)s\" "
-                       "\"ytsearch10:" + query + "\"";
-    ProcResult r = run_capture(cmd);
+    // `query` is its own argv element, so nothing in it can be interpreted as
+    // syntax. Upstream interpolated it straight into an `sh -c` string, which
+    // meant a backtick or $( ) typed into the search box was executed.
+    ProcResult r = run_capture({"yt-dlp", "-4", "--no-warnings",
+                                "--extractor-args",
+                                "youtube:player_client=android;player_skip=webpage,configs,js",
+                                "--match-filters", "categories *= 'Music' & duration >= 90",
+                                "--flat-playlist",
+                                "--print", "%(id)s\t%(title)s\t%(uploader)s",
+                                "ytsearch10:" + query});
     if (!r.ok() || r.out.empty()) return false;
 
     // First line only (in case yt-dlp prints extra diagnostics).
@@ -51,10 +58,13 @@ std::optional<SongResult> YoutubeSource::resolve(const std::string& query, std::
     }
 
     std::string url = "https://www.youtube.com/watch?v=" + id;
-    std::string cmd = "yt-dlp -4 --no-warnings --extractor-args \"youtube:player_client=android;player_skip=webpage,configs,js\" -x -f bestaudio/best --audio-format opus --audio-quality 0 "
-                       "-o " + shell_quote((cached.parent_path() / cached.stem()).string() + ".%(ext)s") + " "
-                       + shell_quote(url);
-    ProcResult r = run_capture(cmd, /*merge_stderr=*/true);
+    ProcResult r = run_capture({"yt-dlp", "-4", "--no-warnings",
+                                "--extractor-args",
+                                "youtube:player_client=android;player_skip=webpage,configs,js",
+                                "-x", "-f", "bestaudio/best",
+                                "--audio-format", "opus", "--audio-quality", "0",
+                                "-o", path_utf8(cached.parent_path() / cached.stem()) + ".%(ext)s",
+                                url}, /*merge_stderr=*/true);
 
     if (!cache_.is_cached(title, "opus")) {
         if (error_out) *error_out = "yt-dlp download failed:\n" + r.out;
@@ -74,10 +84,13 @@ std::optional<SongResult> YoutubeSource::resolve_by_id(const std::string& video_
     }
 
     std::string url = "https://www.youtube.com/watch?v=" + video_id;
-    std::string cmd = "yt-dlp -4 --no-warnings --extractor-args \"youtube:player_client=android;player_skip=webpage,configs,js\" -x -f bestaudio/best --audio-format opus --audio-quality 0 "
-                       "-o " + shell_quote((cached.parent_path() / cached.stem()).string() + ".%(ext)s") + " "
-                       + shell_quote(url);
-    ProcResult r = run_capture(cmd, /*merge_stderr=*/true);
+    ProcResult r = run_capture({"yt-dlp", "-4", "--no-warnings",
+                                "--extractor-args",
+                                "youtube:player_client=android;player_skip=webpage,configs,js",
+                                "-x", "-f", "bestaudio/best",
+                                "--audio-format", "opus", "--audio-quality", "0",
+                                "-o", path_utf8(cached.parent_path() / cached.stem()) + ".%(ext)s",
+                                url}, /*merge_stderr=*/true);
 
     if (!cache_.is_cached(title, "opus")) {
         if (error_out) *error_out = "yt-dlp download failed:\n" + r.out;

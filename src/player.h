@@ -2,12 +2,12 @@
 #include <atomic>
 #include <memory>
 #include "miniaudio.h"
-#include "streaming_pcm.h"
+#include "pcm_ring.h"
 #include "fft_visualizer.h"
 
 namespace muisc {
 
-// Plays back a StreamingPcm buffer through a real audio device via
+// Plays back a PcmRing through a real audio device via
 // miniaudio, using the backend pinned in audio_backend.h
 // (PulseAudio/ALSA -> PipeWire on Linux, WASAPI on Windows, OpenSL ES on
 // Android).
@@ -39,18 +39,41 @@ public:
     // the device down. `fft_sink`, if given, gets push_samples() called
     // from the audio callback with each chunk actually played (nullptr
     // to disable — e.g. not needed for a plain smoke test).
-    bool play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volume_pct,
+    bool play(std::shared_ptr<PcmRing> pcm, double start_sec, int volume_pct,
               FftVisualizer* fft_sink = nullptr);
+
+    // Switches to another buffer WITHOUT tearing the audio device down.
+    //
+    // play() cannot be used at a gapless boundary: its first act is stop(),
+    // i.e. ma_device_uninit followed by a fresh init, which is tens of
+    // milliseconds of silence -- audible as a gap between album tracks, which
+    // is the exact thing gapless playback exists to avoid.
+    //
+    // Safe against the live callback by double-buffering: the callback reads
+    // whichever slot `active_slot_` names, and this fills the OTHER slot before
+    // flipping it. Nothing the callback might be mid-read on is reassigned, and
+    // the outgoing buffer stays alive in its slot rather than being freed
+    // underneath it.
+    void adopt_ring(std::shared_ptr<PcmRing> ring, double start_sec);
 
     void pause();
     void resume();
     bool is_paused() const { return paused_; }
 
-    void seek_relative(double delta_sec);
+    // Seek within what the ring still holds. Returns false when the target is
+    // outside it, which means the caller must restart the producer at that
+    // offset instead (App::seek_to does exactly that).
+    bool try_seek_in_window(double target_sec);
+    // Move the cursor for a seek that IS being served by a producer restart.
+    // Must run BEFORE the restart is requested: it clears finished_, without
+    // which the empty window the restart briefly creates is read as
+    // end-of-track and the run loop skips to the next song.
+    void rebase_for_restart(double target_sec);
     void set_volume(int volume_pct);
-    int volume() const { return volume_pct_; }
+    int volume() const { return volume_pct_.load(); }
 
     double poll_elapsed() const;
+    double position_seconds() const { return poll_elapsed(); }
     bool finished() const { return finished_.load(); }
     // Synchronously clears a stale finished flag left over from the
     // previous track. play() itself resets this too, but play() now
@@ -62,6 +85,45 @@ public:
     // past the track that was just supposed to start.
     void clear_finished() { finished_.store(false); }
 
+    // Ends the outgoing track's audio AND its clock immediately, from any
+    // thread, without touching the device.
+    //
+    // This exists because there was no single moment at which a track ended.
+    // Everything that actually stopped the previous one -- silencing the
+    // device, zeroing the cursor -- lived inside play(), which runs on the
+    // device worker and cannot start until the NEW track has finished
+    // resolving and probing. For an online track that is seconds. Until then
+    // the old audio stayed audible, and poll_elapsed() kept returning the old
+    // track's position while the UI had already switched to the new one -- so
+    // the progress bar, the timestamp and the synced lyrics all ran against a
+    // clock belonging to a song that was no longer on screen.
+    //
+    // Deliberately NOT stop(). That calls ma_device_uninit(), which is
+    // apartment-bound to the thread that created the device (see the COM note
+    // in app.h) and blocks for tens to hundreds of milliseconds; on the main
+    // thread it would freeze the render loop, which is the exact thing running
+    // device work off-thread exists to prevent. This is a single release store
+    // instead, and the callback honours it within one device period (~10 ms).
+    //
+    // Deliberately not paused_ either: that is user-visible state -- is_paused()
+    // drives the pause indicator and freezes the disk art -- and resume() would
+    // clear it out from under a switch that is still in flight.
+    void begin_track_switch();
+
+    // True from begin_track_switch() until the incoming ring is installed by
+    // play()/adopt_ring(). App polls this every frame as one third of its "is
+    // the new track actually audible yet" test -- see
+    // App::pending_track_audible().
+    bool is_switching() const { return switching_.load(std::memory_order_acquire); }
+
+    // True only between a successful ma_device_start() and stop(). Needed
+    // because play() clears switching_ BEFORE ma_device_init (see the comment
+    // there -- deliberately, so the first callback of the new device already
+    // plays audio), so !is_switching() on its own is ALSO true for a play()
+    // that then failed to open a device. Committing the UI on that would mean
+    // showing a track that can never be heard.
+    bool device_live() const { return device_live_.load(std::memory_order_acquire); }
+
     void stop();
 
 private:
@@ -69,15 +131,38 @@ private:
     bool context_ready_ = false;
     ma_device device_{};
     bool device_ready_ = false;
+    // The main-thread-readable mirror of device_ready_. That one is only ever
+    // touched by the device worker and is not atomic, so the render loop cannot
+    // look at it.
+    std::atomic<bool> device_live_{false};
 
-    std::shared_ptr<StreamingPcm> pcm_;
+    // Two slots rather than one pointer, so adopt_ring() can hand the callback
+    // a new buffer without a lock and without freeing the old one.
+    std::shared_ptr<PcmRing> pcm_slots_[2];
+    std::atomic<int> active_slot_{0};
     FftVisualizer* fft_sink_ = nullptr;
-    int sample_rate_ = 44100;
+    // These are read from the main/render thread every frame while the
+    // device worker thread may be inside play(). They are atomics rather than
+    // mutex-protected state on purpose: a mutex held across ma_device_init()
+    // would block the render loop for however long device initialisation
+    // stalls, which is the exact thing running play() off-thread exists to
+    // avoid.
+    std::atomic<int> sample_rate_{44100};
     std::atomic<long long> cursor_frames_{0};
     std::atomic<bool> finished_{false};
     std::atomic<float> gain_{0.7f};
     std::atomic<bool> paused_{false};
-    int volume_pct_ = 70;
+    // Set by begin_track_switch(), cleared by play()/adopt_ring() once the
+    // incoming ring is installed. While set, the callback emits silence and --
+    // the load-bearing half -- leaves cursor_frames_ and finished_ alone.
+    std::atomic<bool> switching_{false};
+    std::atomic<int> volume_pct_{70};
+    // Highest frame the producer has published, mirrored out of the ring by
+    // the audio callback. The main thread needs this to decide whether a
+    // forward seek is already decoded, and mirroring it through an atomic
+    // preserves the rule above: the main thread never dereferences pcm_, which
+    // the device worker may be reassigning at the same moment.
+    std::atomic<long long> decoded_hi_frames_{0};
 
     static void data_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count);
 };

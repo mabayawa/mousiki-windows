@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -16,10 +17,15 @@
 #include "native_duration.h"
 #include "online_source.h"
 #include "player.h"
+#include "queue_item.h"
+#include "queue_ops.h"
 #include "settings.h"
 #include "snapshot.h"
+#include "librespot_session.h"
+#include "spotify_control.h"
+#include "spotify_source.h"
 #include "sphere_visualizer.h"
-#include "streaming_pcm.h"
+#include "decode_session.h"
 #include "terminal_ui.h"
 #include "waveform.h"
 #include "youtube_source.h"
@@ -27,16 +33,13 @@
 
 namespace muisc {
 
-enum class Mode { Browse, Search, Settings, ColorEdit, Console, Cheatsheet, BulkAdd, RetryLyrics };
+enum class Mode { Browse, Search, Settings, ColorEdit, Console, Cheatsheet, BulkAdd, RetryLyrics,
+                  SpotifyLibrary };
 enum class ListSource { Local, Online };
 
-struct QueueItem {
-    bool is_local;
-    std::string title;
-    std::string artist;
-    fs::path local_path;   // valid if is_local
-    std::string video_id;  // valid if !is_local
-};
+// QueueItem now lives in queue_item.h, moved there verbatim (field order
+// included -- see its comment) so queue_ops.h can be a leaf translation unit the
+// unit tests link without dragging in miniaudio through player.h.
 
 class App {
 public:
@@ -48,6 +51,9 @@ private:
     CacheManager cache_;
     YoutubeSource youtube_{cache_};
     OnlineSource online_;
+    SpotifySource spotify_;
+    SpotifyControl spotify_ctl_;
+    LibrespotSession librespot_;
     LocalSource local_source_;
     DiskArt disk_;
     mutable Player player_;
@@ -66,6 +72,12 @@ private:
     ListSource pre_search_list_source_ = ListSource::Local;
     std::string pre_search_local_query_;
     std::string last_online_query_;
+    // Which online source produced online_view_. Spotify and YouTube results
+    // share one type (OnlineResult), so without this the search bar labels a
+    // "sp:" search "SEARCH ONLINE" and echoes it back as "/s:<query>" -- which
+    // is not just cosmetically wrong, it hides the fact that "sp:" exists at
+    // all from the one screen that would otherwise teach it.
+    bool last_online_was_spotify_ = false;
     int local_sort_mode_ = 0; // 0=folder order, 1=title A-Z, 2=artist A-Z
     static constexpr int kListVisibleRows = 8; // the *maximum*/preferred list height when there's room for it
 
@@ -117,12 +129,13 @@ private:
     fs::path current_path_;
     bool current_is_local_ = true;  // for snapshot identity -- current_path_ alone is ambiguous
                                      // (online tracks resolve to a cache path too)
-    std::string current_video_id_;  // valid when !current_is_local_
+    std::string current_video_id_;
+    std::string current_spotify_uri_;  // valid when !current_is_local_
     TrackMetadata metadata_;
     std::vector<float> waveform_envelope_;
     std::chrono::steady_clock::time_point waveform_reveal_start_;
     bool waveform_ready_ = false;
-    std::shared_ptr<StreamingPcm> current_pcm_;
+    std::shared_ptr<DecodeSession> current_session_;
     size_t total_sec_ = 0;
     double angle_ = 0.0;
     std::chrono::steady_clock::time_point last_frame_time_;
@@ -132,6 +145,69 @@ private:
     mutable std::string last_lyrics_status_;
     mutable std::chrono::steady_clock::time_point lyrics_status_shown_at_;
     mutable double viz_dt_ = 0.08;
+
+    // --- a track switch that has not become audible yet -------------------
+    //
+    // The UI used to become the new track at the KEYPRESS. On the Spotify paths
+    // the new track's audio does not START at the keypress -- it starts one or
+    // two HTTPS round trips later (Connect), or once librespot's pipe carries
+    // the new stream (librespot). So the progress clock restarted at 0:00, the
+    // new lyrics scrolled, and the old song was still coming out of the
+    // speakers. The UI was describing a future.
+    //
+    // Now everything that makes the UI "become" the new track is held here
+    // until a per-source predicate says that track's audio is genuinely
+    // playing, and then applied in one shot by commit_pending_track(). Until
+    // then has_track_ stays false, which is ALREADY exactly the neutral panel
+    // we want: no title, no lyrics, no visualizer, a still progress bar, and no
+    // auto-advance. That is why this costs one placeholder string rather than a
+    // render rework.
+    //
+    // adopt_prefetched_spotify() is the precedent -- it has always refused to
+    // touch the UI until boundary_seq() said the reader had really begun
+    // filling the next ring.
+    enum class TrackSource { Local, Youtube, Librespot, Remote };
+    struct PendingTrack {
+        bool valid = false;
+        TrackSource src = TrackSource::Local;
+        bool is_local = true;
+        fs::path path;
+        std::string video_id;
+        std::string spotify_uri;
+        TrackMetadata metadata;
+        size_t total_sec = 0;
+        // launch_lyrics_fetch()'s three arguments, captured verbatim at arm
+        // time: the fetch is keyed only on (title, artist), so they must not be
+        // re-derived at commit time from fields that may have moved on.
+        std::string lyrics_title, lyrics_artist;
+        fs::path lyrics_path;
+        // The absolute ring frame this stream begins at, so "has new PCM
+        // arrived" is "> origin" rather than "> 0" -- which keeps it correct for
+        // a snapshot resumed mid-track and for a post-seek origin.
+        long long origin_frames = 0;
+        // Remote only: set by poll_spotify() once /me/player reports this uri
+        // playing, with the position it reported.
+        bool remote_confirmed = false;
+        double confirmed_pos_sec = 0.0;
+        std::string label;           // the title, for the loading line
+        double timeout_sec = 6.0;
+        std::chrono::steady_clock::time_point armed_at{};
+    };
+    PendingTrack pending_track_;
+    // True from begin_track_switch() until commit_pending_track() or
+    // abort_pending_track(). Main thread only, like every other field in this
+    // view model -- no atomic, and nothing on the render path takes a lock for
+    // it.
+    bool switch_in_flight_ = false;
+    SpotifyControl::Ticket switch_pause_ticket_ = 0;
+    SpotifyControl::Ticket switch_play_ticket_ = 0;   // remote: gates eager state polling
+
+    void arm_pending_track(PendingTrack pt);
+    bool pending_track_audible() const;
+    void commit_pending_track();
+    void abort_pending_track(const std::string& why);
+    void poll_pending_commit();
+    std::string switch_status_text() const;
 
     // --- lyrics (background-fetched) ---
     mutable std::mutex lyrics_mutex_;
@@ -186,6 +262,16 @@ private:
     void build_console_screen(std::ostringstream& frame, int W, int target_height) const;
 
     // --- cheatsheet overlay (HKeyCheatsheet) ----------------------------
+    // Scrolls now, and lays out in two columns when there is room. It used to
+    // index its row table BY SCREEN ROW, so every entry past the visible count
+    // was silently not drawn at all -- on a 30-row terminal that was the last
+    // two of twenty-seven.
+    // mutable because build_cheatsheet_screen() is const and clamps this to the
+    // scroll range it just computed from the terminal height and column count.
+    // Writing the clamp back is what stops a held arrow key inflating the
+    // counter so far that scrolling back up takes dozens of presses. Same
+    // precedent as last_lyrics_status_ and the visualiser state above.
+    mutable int cheatsheet_scroll_ = 0;
     void build_cheatsheet_screen(std::ostringstream& frame, int W) const;
 
     // The Console and Settings overlays must always be exactly as tall as
@@ -265,6 +351,105 @@ private:
     static constexpr int kBulkAddPanelWidth = 62; // matches the reference design exactly
     std::vector<std::string> build_bulk_add_panel() const; // returns fixed-width, fixed-height lines for draw_floating_panel()
 
+    // --- Spotify library overlay (HKeySpotifyLibrary, 'o') ----------------
+    //
+    // A full-screen mode takeover, like Console/Settings/Cheatsheet and unlike
+    // the floating panels: two panes side by side, the flat library on the left
+    // and the hovered row's tracks on the right.
+    //
+    // Deliberately NOT routed through SpotifyControl. That is a single-worker
+    // FIFO whose ordering is exactly what makes the transport handover gapless
+    // (see the staged librespot comment above for what happens when it is
+    // violated), so parking a paginated library fetch in it would delay a pause
+    // behind three HTTPS round trips. These use the plain background-thread
+    // handoff instead -- launch_bulk_add_async's shape, plus the try/catch(...)
+    // guard that launch_spotify_search_async has and bulk add lacks.
+    enum class LibPane { Items, Tracks };
+
+    struct LibrarySnapshot {
+        bool ok = false;
+        std::string error;
+        SpotifyProfile profile;
+        std::vector<SpotifyLibraryItem> items;  // classified and ordered already
+    };
+
+    LibrarySnapshot library_;        // adopted; main thread only, like every
+                                    // other field in this view model
+    bool library_loaded_ = false;   // session cache validity. Stays false after
+                                    // a failure, so the next 'o' retries.
+    LibPane lib_pane_ = LibPane::Items;
+    int lib_item_cursor_ = 0, lib_item_scroll_ = 0;
+    int lib_track_cursor_ = 0, lib_track_scroll_ = 0;
+    // True while '/' is live: keystrokes go to the buffer, not to the command
+    // switch. Without the flag, typing "add" into a filter would queue a
+    // playlist on the 'a'.
+    bool lib_filtering_ = false;
+    std::string lib_filter_;
+    std::vector<int> lib_visible_;   // indices into library_.items after the filter
+
+    // Per-item track cache, session lifetime, never written to disk. Keyed by
+    // item id. A cached-but-EMPTY vector is a real answer -- an empty playlist,
+    // or one holding only local files -- so "is it cached" is count(), never
+    // empty(), or those two would refetch on every cursor rest.
+    std::unordered_map<std::string, std::vector<OnlineResult>> lib_track_cache_;
+    std::string lib_tracks_key_;              // which id lib_tracks_ mirrors
+    std::vector<OnlineResult> lib_tracks_;    // the right pane's rows
+    // item.tracks minus what came back: the count Spotify reports includes
+    // local files, which the helper drops. Without saying so, a playlist of 37
+    // local files reads as an inexplicably empty pane.
+    int lib_tracks_dropped_ = 0;
+    std::string lib_tracks_error_;            // right-pane-only failure
+
+    // Moving the left cursor does NOT fetch. It stamps this, and the poll starts
+    // the fetch once the cursor has been still for the debounce -- otherwise
+    // holding Down through 141 rows would be 141 Python interpreters and 141
+    // HTTPS round trips.
+    std::chrono::steady_clock::time_point lib_cursor_moved_at_{};
+    static constexpr double kLibTrackDebounceSec = 0.25;
+    // 'a' pressed on an item whose tracks have not arrived yet: remember which,
+    // and queue it when the matching result lands, so the key always works
+    // rather than telling the user to press it again.
+    std::string lib_queue_when_loaded_;
+    // Below this total width two panes leave ~16 inner columns each, which
+    // cannot hold a usable row, so only the focused pane is drawn.
+    static constexpr int kLibraryMinTwoPaneWidth = 72;
+    // How many body rows the panes actually got this frame. Computed in
+    // render_frame (which is non-const) before the const builders run, the
+    // same way list_visible_rows_ is, so the scroll maths and what is drawn
+    // can never disagree.
+    int lib_body_rows_ = 1;
+
+    std::thread lib_thread_;
+    std::mutex lib_mutex_;
+    std::atomic<bool> lib_in_progress_{false};
+    std::atomic<bool> lib_ready_{false};
+    LibrarySnapshot pending_library_;          // guarded by lib_mutex_
+
+    struct LibTracksResult {
+        std::string key;            // the item id this answers for, so a reply
+                                    // for a row the cursor has left is discarded
+        int declared_total = 0;
+        std::string error;
+        std::vector<OnlineResult> items;
+    };
+    std::thread lib_tracks_thread_;
+    std::mutex lib_tracks_mutex_;
+    std::atomic<bool> lib_tracks_in_progress_{false};
+    std::atomic<bool> lib_tracks_ready_{false};
+    LibTracksResult pending_lib_tracks_;       // guarded by lib_tracks_mutex_
+
+    void open_spotify_library();
+    void launch_library_async(bool force_refresh);
+    void poll_pending_library();
+    void launch_library_tracks_async(const SpotifyLibraryItem& item);
+    void poll_pending_library_tracks();
+    void library_refresh_filter();
+    const SpotifyLibraryItem* library_hovered() const;
+    int  library_queue_tracks(const std::vector<OnlineResult>& items);
+    void build_spotify_library_screen(std::ostringstream& frame, int W) const;
+    std::vector<std::string> build_library_items_pane(int total_width, int body_h) const;
+    std::vector<std::string> build_library_tracks_pane(int total_width, int body_h) const;
+
     // --- retry lyrics (HKeyRetryLyrics, 'l') ------------------------------
     // A manual override form: rather than instantly re-fetching with the
     // track's own metadata, this lets the person edit the title/artist
@@ -303,9 +488,10 @@ private:
         bool success = false;
         std::string title, artist, location_label, error;
         fs::path path;
-        std::shared_ptr<StreamingPcm> pcm;
+        std::shared_ptr<DecodeSession> session;
         size_t total_sec = 0;
         TrackMetadata metadata;
+        std::string spotify_uri;
         bool is_local = true;   // for snapshot/resume identity -- which of path/video_id is authoritative
         std::string video_id;   // valid if !is_local
     };
@@ -315,24 +501,165 @@ private:
     std::atomic<bool> load_in_progress_{false};
     std::atomic<int> load_stage_{0};
     std::chrono::steady_clock::time_point load_started_at_;
+    // --- audio device worker ---
+    //
+    // One persistent thread owns the whole device lifecycle for the session.
+    // Upstream spawned a fresh std::thread per track, which is fine on
+    // ALSA/PulseAudio/CoreAudio but not on WASAPI: miniaudio initialises COM
+    // on whichever thread creates the device, and COM interfaces are
+    // apartment-affine. When a per-track thread exits, COM is uninitialised
+    // for it and the IAudioClient created there is left owned by a thread that
+    // no longer exists -- so the next track's init, or the eventual uninit,
+    // reaches through a dangling apartment.
+    //
+    // Keeping init/start/stop/uninit on a single thread for the whole session
+    // removes the affinity problem outright, and costs nothing on the other
+    // platforms. The generation counter still supersedes stale requests
+    // exactly as it did before; only the thread's lifetime changed.
+    struct DeviceRequest {
+        std::shared_ptr<PcmRing> pcm;
+        double start_sec = 0.0;
+        int volume = 70;
+        int gen = 0;
+        bool valid = false;
+    };
     std::thread device_thread_;
     std::mutex device_mutex_;
-    std::atomic<int> device_gen_{0}; // incremented each launch; stale threads abort when their gen != current
+    std::condition_variable device_cv_;
+    DeviceRequest device_request_;      // latest request wins; guarded by device_mutex_
+    bool device_worker_quit_ = false;   // guarded by device_mutex_
+    std::atomic<int> device_gen_{0};    // incremented each launch; stale requests are dropped
     void launch_device_play_async();
+    void start_device_worker();
+    void stop_device_worker();
+    void device_worker_loop();
 
     PendingLoad pending_load_;
     void launch_load_async(fs::path local_path, std::string title, std::string artist,
-                            std::string location_label, bool is_local, std::string video_id);
+                            std::string location_label, bool is_local, std::string video_id,
+                            std::string spotify_uri = std::string());
     void poll_pending_load();
     static void write_load_timing_log(const std::string& title, bool is_local, double t_resolve,
                                        double t_probe, double t_total, const std::string& error);
 
-    // --- deferred mini-waveform pass ---
-    std::mutex waveform_mutex_;
-    std::atomic<bool> waveform_pending_ready_{false};
-    std::atomic<int> waveform_epoch_{0}; // incremented on each recompute; stale threads discard their result
-    std::vector<float> pending_waveform_envelope_;
+    // --- waveform envelope ---
+    // The mutex, the "pending envelope" handoff and the epoch counter that
+    // used to live here are gone: the envelope is no longer produced by a
+    // detached thread racing to publish a whole-track result, it is read
+    // straight off the DecodeSession's retained bins.
+    //
+    // True once the full-speed scan has been folded in, so the live
+    // (progressively filling) envelope stops overwriting the final one.
+    bool waveform_scan_applied_ = false;
+    int  waveform_live_tick_ = 0;
     void poll_pending_waveform();
+    void seek_to(double target_sec);
+    void seek_relative(double delta_sec);
+
+    // --- Spotify Connect ("remote") playback ---------------------------
+    // When the Spotify desktop app is open we drive IT over the Web API
+    // instead of decoding audio ourselves. That is the whole point -- no
+    // librespot needed -- but it also means mousiki never sees a single PCM
+    // sample, so the FFT, waveform and disk visualizers have nothing to draw.
+    // The UI has to say so, or they just look broken.
+    bool spotify_remote_ = false;
+    bool spotify_remote_paused_ = false;
+    std::string spotify_device_id_;
+    std::string spotify_device_name_;
+    std::vector<SpotifyDevice> spotify_devices_;
+    std::chrono::steady_clock::time_point spotify_devices_at_{};
+    std::chrono::steady_clock::time_point spotify_state_at_{};
+    // Position is polled about every 2 s and interpolated in between, so the
+    // progress bar moves smoothly instead of stepping once per poll.
+    double spotify_pos_base_ = 0.0;
+    std::chrono::steady_clock::time_point spotify_pos_at_{};
+
+    // A Spotify row was picked but the device list is not fresh yet, so the
+    // remote-vs-fallback decision has to wait one round trip.
+    OnlineResult pending_spotify_play_;
+    bool spotify_play_pending_ = false;
+
+    // Volume has to reach the Connect device too, not just our own gain --
+    // see the comment on the definition.
+    void apply_volume(int percent);
+    void poll_spotify();
+    void resolve_spotify_play(const OnlineResult& r);
+    void spotify_begin(const OnlineResult& r);
+    void spotify_fallback_to_youtube(const OnlineResult& r);
+
+    // --- Spotify audio through librespot, into our own ring ---------------
+    // The other half of B0: with no desktop app to drive, librespot decrypts
+    // the stream and we read raw PCM from its stdout. Unlike remote mode this
+    // DOES give us samples, so the visualizers work and the position is exact.
+    bool spotify_librespot_ = false;
+    std::string librespot_device_id_;
+    fs::path librespot_exe_;
+    bool librespot_checked_ = false;      // resolution attempted this session
+    bool librespot_unavailable_ = false;  // ... and there is no binary
+    OnlineResult pending_librespot_play_;
+    bool librespot_play_pending_ = false;
+    std::chrono::steady_clock::time_point librespot_wait_start_{};
+    bool librespot_said_auth_ = false;    // the one-time browser notice
+
+    // --- staged librespot start -------------------------------------------
+    //
+    // Starting a librespot track is four steps that MUST be separated in time,
+    // and the old code did all four in microseconds:
+    //
+    //   1. pause Spotify                    (a 200-600 ms HTTPS round trip)
+    //   2. drain the pipe of the old track  (only valid once 1 has LANDED)
+    //   3. install the new plan, unpause the reader
+    //   4. tell Spotify to play the new uri
+    //
+    // Firing 2 while 1 was merely QUEUED meant the drain was racing a stream
+    // that was still being written: it never saw its 250 ms of quiet, hit its
+    // 2 s cap, cleared resync_, and the reader then wrote the OUTGOING track's
+    // PCM into the INCOMING track's ring starting at frame 0. That is what the
+    // user heard -- not the old track still playing, but the old track being
+    // replayed as the new one, under the new one's clock and lyrics.
+    //
+    // Modelled on the pending_librespot_play_ deferral just above, which
+    // already defers a start by a Web API round trip.
+    enum class LsStage { None, AwaitPause, AwaitDrain };
+    LsStage ls_stage_ = LsStage::None;
+    OnlineResult ls_track_;
+    double ls_start_sec_ = 0.0;
+    // A seek is the same four steps for the SAME track: no UI identity to
+    // commit, and the audio device must keep running rather than be re-inited.
+    bool ls_is_seek_ = false;
+    SpotifyControl::Ticket ls_pause_ticket_ = 0;
+    std::chrono::steady_clock::time_point ls_stage_at_{};
+    bool ls_warned_slow_ = false;
+    static constexpr double kLsPauseWaitSec = 2.0;
+    static constexpr double kLsDrainWaitSec = 6.0;
+    void ls_advance_stage();
+    void ls_install_plan_and_play();
+
+    fs::path resolve_librespot();
+    bool start_spotify_librespot(const OnlineResult& r);
+    bool launch_librespot_track(const OnlineResult& r, double start_sec);
+    void poll_librespot();
+    // Returns the ticket of the pause it issued, or 0 when there was nothing to
+    // pause. The caller needs it: on the librespot path the resync drain is only
+    // meaningful once this specific pause has actually landed.
+    SpotifyControl::Ticket stop_spotify_audio();
+
+    // --- gapless prefetch -------------------------------------------------
+    // The next track handed to Spotify before the current one ends, so the byte
+    // stream runs straight from one into the other.
+    OnlineResult prefetch_track_;
+    std::shared_ptr<DecodeSession> prefetch_session_;
+    bool prefetch_valid_ = false;
+    int  prefetch_boundary_ = 0;
+
+    bool peek_next_spotify(OnlineResult& out) const;
+    void maybe_prefetch_spotify();
+    bool adopt_prefetched_spotify();
+    bool start_spotify_remote(const OnlineResult& r);
+    std::string pick_spotify_device() const;
+    void launch_device_stop_async();
+    // Elapsed seconds for whichever transport is live.
+    double current_elapsed() const;
 
     // --- async online search ---
     std::thread search_thread_;
@@ -340,7 +667,9 @@ private:
     std::atomic<bool> search_ready_{false};
     std::atomic<bool> search_in_progress_{false};
     std::vector<OnlineResult> pending_search_results_;
+    std::string pending_search_error_;   // guarded by search_mutex_
     void launch_search_async(const std::string& query);
+    void launch_spotify_search_async(const std::string& query);
     void poll_pending_search();
 
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---
@@ -401,6 +730,24 @@ private:
     void play_relative(int delta);
     void play_relative_random();
     void advance_track();
+    // The single "the outgoing track ends NOW" moment, run on the main thread
+    // as the first act of every start path.
+    //
+    // Before this existed, each of the four start paths ended the previous
+    // track by hand, and none of them did it at the point the user actually
+    // asked. The audio stop and the clock reset both lived inside
+    // Player::play() on the device worker, which cannot run until the new
+    // track has finished resolving and probing -- seconds, for an online
+    // track. Everything in between was inconsistent: the old song still
+    // audible, the new song's title on screen, and the old song's position
+    // driving the new song's progress bar, timestamp and synced lyrics.
+    void begin_track_switch();
+    // The per-track UI state half of the above, without the audio cut.
+    // Split out for the gapless path: adopt_prefetched_spotify() must clear
+    // the visualisers but must NOT silence the device or shut down the
+    // session it is in the middle of adopting -- silence at an album boundary
+    // is the exact artefact gapless playback exists to remove.
+    void reset_per_track_ui_state();
     // Where the currently-playing track sits within *this list source's*
     // current view (local_view_ or online_view_, whichever list_source_
     // is showing), by identity match (path for local, video_id for
@@ -422,11 +769,36 @@ private:
     // so both respect the queue exactly the same way. Caller must check
     // !queue_.empty() first.
     void play_next_from_queue();
+    // Plays queue_[idx] and consumes it exactly the way play_next_from_queue()
+    // always has -- erased, or rotated to the back under Repeat Queue -- so
+    // "Enter on a queue row" and "auto-advance into the queue" cannot drift
+    // apart. The single consumption path; play_next_from_queue() picks an index
+    // and delegates here.
+    void play_queue_index(int idx);
+    // Reconstitutes a QueueItem back into the LocalTrack/OnlineResult the start
+    // paths take, and dispatches. Split out of play_next_from_queue() so
+    // play_queue_index() is the only place that knows about consumption.
+    void start_queue_item(const QueueItem& item);
+    // Is this queue row the track that's actually playing right now? Local
+    // items match on path, online ones on spotify_uri when they have one and
+    // video_id otherwise -- the same identity rule current_track_list_index()
+    // uses, and for the same reason: every Spotify row carries an empty
+    // video_id, so matching on that alone made them all match each other.
+    bool queue_item_is_current(const QueueItem& item) const;
+    // Is list row `idx` (of whichever view list_source_ is showing) already
+    // sitting in the queue? Drives the little marker in the list panel, which
+    // is what makes "collect tracks across several searches" legible -- a new
+    // search replaces the results, so without it there's no way to see what
+    // you already took from the previous one.
+    bool list_row_in_queue(int idx) const;
     // Single letter for the mode-indicator button after the search bar:
     // L=list, R=repeat, S=shuffle, Q=repeat queue, O=stop (play-and-stop
     // -- not "S", that's shuffle's letter already).
     char play_mode_letter() const;
-    void queue_add_selected();
+    // Returns the title of the track it queued, or "" if there was nothing
+    // hovering to add -- so the caller can name it in the status line instead
+    // of reporting a bare "added to queue" that might not have happened.
+    std::string queue_add_selected();
     void queue_remove_last();
     void queue_remove_hovering();
     void queue_move_hovering(int dir); // dir=-1 up, +1 down

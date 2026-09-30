@@ -1,0 +1,5 @@
+{
+  "ok": false,
+  "error": "NO_AUTH",
+  "detail": "no cached token; run login first"
+}

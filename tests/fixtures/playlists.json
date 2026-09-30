@@ -1,0 +1,59 @@
+{
+  "ok": true,
+  "playlists": [
+    {
+      "id": "p1",
+      "name": "Chill Vibes",
+      "owner": "mabayawa",
+      "owner_id": "bono",
+      "tracks": 82,
+      "uri": "spotify:playlist:p1",
+      "kind": "playlist"
+    },
+    {
+      "id": "p2",
+      "name": "Tagalog OPM Hits",
+      "owner": "Spotify",
+      "owner_id": "spotify",
+      "tracks": 100,
+      "uri": "spotify:playlist:p2",
+      "kind": "playlist"
+    },
+    {
+      "id": "p3",
+      "name": "gym",
+      "owner": "mabayawa",
+      "owner_id": "bono",
+      "tracks": 27,
+      "uri": "spotify:playlist:p3",
+      "kind": "playlist"
+    },
+    {
+      "id": "p4",
+      "name": "someone else's mix",
+      "owner": "",
+      "owner_id": "u_other",
+      "tracks": 12,
+      "uri": "spotify:playlist:p4",
+      "kind": "playlist"
+    },
+    {
+      "id": "p5",
+      "name": "impostor",
+      "owner": "mabayawa",
+      "owner_id": "u_twin",
+      "tracks": 3,
+      "uri": "spotify:playlist:p5",
+      "kind": "playlist"
+    },
+    {
+      "id": "",
+      "name": "broken",
+      "owner": "x",
+      "owner_id": "x",
+      "tracks": 1,
+      "uri": "",
+      "kind": "playlist"
+    }
+  ]
+}

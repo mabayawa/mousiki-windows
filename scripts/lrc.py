@@ -1,5 +1,18 @@
+import sys
 import requests
 import xml.etree.ElementTree as ET
+
+# Windows has no LANG/LC_ALL. When stdout is a pipe -- which it always is here,
+# because mousiki captures it -- Python picks the process ANSI code page for
+# the pipe encoding, so printing a non-Latin track title raises
+# UnicodeEncodeError and kills the script outright. Forcing UTF-8 on both
+# streams matches what the C++ side already decodes.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 BETTER_LYRICS_API = "https://lyrics-api.boidu.dev/getLyrics"
@@ -274,7 +287,10 @@ def get_lyrics(song, artist):
     """
 
     try:
-        print("Trying Better Lyrics...")
+        # stderr, not stdout: fetch_lyrics.py's stdout is a JSON document that
+        # lyrics_fetcher.cpp parses. Progress chatter printed to stdout lands
+        # in the middle of it.
+        print("Trying Better Lyrics...", file=sys.stderr)
 
         return get_better_lyrics(
             song,
@@ -284,11 +300,11 @@ def get_lyrics(song, artist):
     except Exception as e:
 
         print(
-            f"Better Lyrics failed: {e}"
+            f"Better Lyrics failed: {e}", file=sys.stderr
         )
 
     try:
-        print("Trying LRCLIB...")
+        print("Trying LRCLIB...", file=sys.stderr)
 
         return get_lrclib_lyrics(
             song,
@@ -298,7 +314,7 @@ def get_lyrics(song, artist):
     except Exception as e:
 
         print(
-            f"LRCLIB failed: {e}"
+            f"LRCLIB failed: {e}", file=sys.stderr
         )
 
     raise RuntimeError(

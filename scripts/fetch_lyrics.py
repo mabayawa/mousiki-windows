@@ -1,8 +1,8 @@
 import json
 import os
 import re
-import signal
 import sys
+import threading
 
 # lrc.py (same directory) does the actual fetching: Better Lyrics first
 # (word-level TTML, converted to enhanced LRC here in lrc.py itself),
@@ -14,8 +14,25 @@ import sys
 # pick up the new source.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows has no LANG/LC_ALL. When stdout is a pipe -- which it always is here,
+# because mousiki captures it -- Python picks the process ANSI code page for
+# the pipe encoding, so printing a non-Latin track title raises
+# UnicodeEncodeError and kills the script outright. Forcing UTF-8 on both
+# streams matches what the C++ side already decodes.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+_watchdog = None
+
 
 def emit(obj):
+    if _watchdog is not None:
+        _watchdog.cancel()
     print(json.dumps(obj))
     sys.exit(0)
 
@@ -57,7 +74,11 @@ def _find_pipx_site_packages(package_name):
         candidates = sorted(glob.glob(os.path.join(venvs_dir, package_name + "*")))
 
         for venv_dir in candidates:
-            venv_python = os.path.join(venv_dir, "bin", "python")
+            # pipx puts the interpreter in Scripts\python.exe on Windows and
+            # bin/python everywhere else.
+            venv_python = os.path.join(venv_dir, "Scripts", "python.exe")
+            if not os.path.isfile(venv_python):
+                venv_python = os.path.join(venv_dir, "bin", "python")
             if not os.path.isfile(venv_python):
                 continue
 
@@ -145,16 +166,33 @@ def main():
             "detail": "the 'requests' package is not available (pip install requests)"
         })
 
-    # Hard 35-second alarm: two sources (Better Lyrics, then LRCLIB), each
+    # Hard 35-second backstop: two sources (Better Lyrics, then LRCLIB), each
     # with its own 10s network timeout inside lrc.py, times up to two
     # attempts (original query, then swapped title/artist below) -- worst
-    # case that's up to ~40s of genuine network waiting. The alarm is a
-    # last-resort backstop so a truly wedged call still returns *something*
-    # to the C++ caller instead of hanging the lyrics fetch forever.
-    try:
-        signal.alarm(35)
-    except (AttributeError, OSError):
-        pass  # Windows or restricted env -- no alarm, best-effort
+    # case that's up to ~40s of genuine network waiting.
+    #
+    # This used to be signal.alarm(35), which does not exist on Windows at all
+    # (it lives behind a try/except AttributeError, so the backstop was simply
+    # absent there) and which, even on POSIX, had no SIGALRM handler installed
+    # -- so firing it killed the process and the C++ side saw an empty capture
+    # rather than a diagnosis. A daemon timer thread behaves identically on
+    # every platform and can report why it gave up.
+    global _watchdog
+
+    def _on_timeout():
+        try:
+            sys.stdout.write(json.dumps({
+                "ok": False,
+                "error": "TIMEOUT",
+                "detail": "lyrics lookup exceeded 35s",
+            }) + "\n")
+            sys.stdout.flush()
+        finally:
+            os._exit(0)
+
+    _watchdog = threading.Timer(35.0, _on_timeout)
+    _watchdog.daemon = True
+    _watchdog.start()
 
     def do_fetch(song, performer):
         return lrc.get_lyrics(song, performer)

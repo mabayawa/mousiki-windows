@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "albums": [
+    {
+      "id": "a1",
+      "name": "In Rainbows",
+      "owner": "Radiohead",
+      "owner_id": "",
+      "tracks": 10,
+      "uri": "spotify:album:a1",
+      "kind": "album"
+    },
+    {
+      "id": "a2",
+      "name": "Blonde",
+      "owner": "Frank Ocean",
+      "owner_id": "",
+      "tracks": 17,
+      "uri": "spotify:album:a2",
+      "kind": "album"
+    }
+  ]
+}

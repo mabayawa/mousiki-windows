@@ -9,6 +9,13 @@ struct OnlineResult {
     std::string title;
     std::string uploader;
     double duration_sec = -1.0; // -1 = unknown (not every extractor/flat-listing includes it)
+
+    // Set only on results that came from Spotify. video_id is empty for those
+    // until something resolves one: the YouTube path searches for
+    // "title artist", and librespot consumes this URI directly. Keeping both
+    // on one struct is what lets Spotify results reuse the existing online
+    // list view unchanged.
+    std::string spotify_uri;
 };
 
 class OnlineSource {
