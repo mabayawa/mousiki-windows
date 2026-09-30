@@ -226,6 +226,10 @@ Discord  : itx.ender
 Version  : orignal and final v1.0 
 Licence  : Apache licence 2.0
 
+Windows + Spotify fork
+Github   : mabayawa/mousiki-windows
+Forked from itzender5820/mousiki
+
 
 Mousiki
 A terminal music player built for people who
@@ -247,6 +251,8 @@ Features
 - Shuffle and repeat
 - Fully configurable colors
 - Fully configurable hotkeys
+- Spotify search, library and playback (fork)
+- Native Windows build (fork)
 
 Configuration
 $HOME/.config/mousiki/config.txt

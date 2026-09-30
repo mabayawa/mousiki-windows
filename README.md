@@ -1,30 +1,52 @@
 # Mousiki for Windows 🎵
 
-A native Windows port of [itzender5820/mousiki](https://github.com/itzender5820/mousiki) — a fast, keyboard-driven terminal music player with spectrum visualizers, synced lyrics and online streaming.
+A fork of [**mousiki**](https://github.com/itzender5820/mousiki) by
+[ender (itzender5820)](https://github.com/itzender5820), a fast, keyboard-driven
+terminal music player with spectrum visualizers, synced lyrics and online
+streaming. This fork adds native Windows support and Spotify.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-orange.svg)](https://github.com/mabayawa/mousiki-windows)
 [![Platform](https://img.shields.io/badge/Platform-Windows_%7C_Linux_%7C_macOS-brightgreen.svg)](https://github.com/mabayawa/mousiki-windows)
 
-> **This is a fork.** All of the design, the TUI, the visualizers and the audio
-> architecture are [ender](https://github.com/itzender5820)'s work. Upstream targets
-> POSIX and lists Windows as *"Unverified Support — I don't have the hardware to test
-> and debug on that operating system."* This fork is that missing half: a real
-> `mousiki.exe` built against the Win32 API and WASAPI. No WSL, no MSYS runtime, no
-> POSIX emulation layer.
+> **This is a fork, not the original project.** Mousiki was created by
+> [ender](https://github.com/itzender5820); the design, the TUI, the visualizers and
+> the audio architecture are their work. For the original, see
+> [itzender5820/mousiki](https://github.com/itzender5820/mousiki).
 >
-> The Linux, macOS and Android builds are kept working — every change is either
+> Upstream targets POSIX and lists Windows as *"Unverified Support — I don't have
+> the hardware to test and debug on that operating system."* This fork started as
+> that missing half: a real `mousiki.exe` built against the Win32 API and WASAPI,
+> with no WSL, no MSYS runtime and no POSIX emulation layer. It has since grown
+> Spotify integration, stereo playback and a reworked queue. All of these are listed
+> under [What this fork adds](#-what-this-fork-adds).
+>
+> The Linux, macOS and Android builds are kept working. Every change is either
 > cross-platform or behind `#ifdef _WIN32`.
 
 ## ✨ Features
+
+From upstream:
 
 - **Local Music Playback:** Instantly browse and play your local music files.
 - **Online Search & Streaming:** Search and stream tracks directly from online sources.
 - **Synced Lyrics:** Real-time, word-by-word active lyrics highlighting as the song plays.
 - **Visualizers:** Real-time FFT spectrum, waveform rendering, and spinning disk art.
 - **Queue Management:** Effortless queueing, shuffling, and repeating.
-- **Your Spotify Library:** Browse your own playlists, the ones you follow and your saved albums with `o`, and queue a track or a whole playlist from there.
 - **Highly Configurable:** Tweak colors, visualizer fluidity, animations, and hotkeys.
+
+Added in this fork:
+
+- **Native Windows:** a Win32/WASAPI build with a one-command `setup.ps1` installer.
+- **Spotify Search:** `/sp: <query>` searches Spotify from inside mousiki.
+- **Real Spotify Audio:** plays the actual Spotify stream through a Connect device
+  or through [librespot](https://github.com/librespot-org/librespot), and falls back
+  to YouTube when neither is available. See [Spotify](#-spotify).
+- **Your Spotify Library:** Browse your own playlists, the ones you follow and your saved albums with `o`, and queue a track or a whole playlist from there.
+- **Stereo Playback:** upstream folds everything to mono; this fork plays stereo end to end.
+- **A Queue You Build From Searches:** the queue survives new searches and restarts, `a` adds from either panel, and `ENTER` on the queue plays that item.
+- **Clean Track Switching:** the old track stops when you press the key, and the UI moves to the new track only once its audio has actually started.
+- **Unit Tests:** a C++ test target and Python tests for the Spotify helper. See [Tests](#-tests).
 
 ## 🚀 Getting Started
 
@@ -37,7 +59,9 @@ A native Windows port of [itzender5820/mousiki](https://github.com/itzender5820/
 | **CMake** | ≥ 3.16 |
 | **FFmpeg** | `ffmpeg` and `ffprobe`, for decoding and metadata. |
 | **yt-dlp** | Optional — online search and streaming only. |
-| **Python 3 + `requests`** | Optional — synced lyrics only. |
+| **Python 3 + `requests`** | Optional — synced lyrics and Spotify. |
+| **Spotify app Client ID** | Optional — Spotify search and library. Premium is needed for Spotify audio. See [Spotify](#-spotify). |
+| **librespot** | Optional — Spotify audio without the Spotify desktop app. |
 
 Local playback works with nothing but FFmpeg.
 
@@ -199,6 +223,101 @@ LocalMusicPath=~/Music
 
 Windows and forward slashes both work, and `~` expands.
 
+## 🟢 Spotify
+
+Spotify is optional and off by default. Leave `SpotifyClientId` blank and mousiki
+behaves exactly like upstream.
+
+### Setup
+
+1. Register a free app at <https://developer.spotify.com/dashboard> and add
+   exactly this redirect URI to it: `http://127.0.0.1:8888/callback`. It must be
+   `127.0.0.1`, because Spotify rejects `localhost`.
+2. Paste the app's Client ID into `config.txt`:
+   ```ini
+   SpotifyClientId=<your client id>
+   ```
+3. Log in once. This opens your browser:
+   ```powershell
+   python scripts\spotify.py --client-id <your client id> login
+   ```
+
+The Client ID is not a secret. Login uses PKCE, so mousiki never asks for or
+stores a client secret. The token is saved to
+`%USERPROFILE%\.cache\mousiki\spotify_token.json`.
+
+### Where the audio comes from
+
+The Web API only provides metadata, so when you play a Spotify track mousiki
+tries these sources in order:
+
+1. **A Spotify Connect device**, such as the Spotify desktop app. mousiki drives
+   it as a remote, and `1`/`2` set that device's volume. The audio comes out of
+   the device, so the visualizers have no samples to draw.
+2. **librespot**, which decrypts the stream and pipes raw PCM into mousiki's own
+   player. The visualizers, waveform and exact position all work. mousiki looks
+   for it at `SpotifyLibrespotPath`, then on `PATH`, then in
+   `%USERPROFILE%\.cache\mousiki\bin\`.
+3. **YouTube**, found by searching for the Spotify title and artist. This is the
+   fallback when neither of the above is available, and it works without Premium.
+
+Both Spotify transports need a Premium account.
+
+librespot publishes no prebuilt binaries. You can get one in either of two ways:
+
+- Build it locally:
+  ```powershell
+  cargo install librespot --locked --no-default-features --features native-tls
+  ```
+  and point `SpotifyLibrespotPath` at the result.
+- Run the `librespot` workflow in this repository (`.github/workflows/librespot.yml`).
+  It builds and checksums a binary and attaches it to a release. Pin its URL and
+  sha256 in `LIBRESPOT_BUILDS` in `scripts/spotify.py`, and mousiki will download
+  and verify it. The table ships empty, so nothing is downloaded until you do this.
+
+`SpotifyPrefetch=1` (the default) hands librespot the next track before the
+current one ends, so playback continues without a gap.
+
+## 🧩 What this fork adds
+
+Apart from the Windows port (next section), the fork also adds:
+
+- **Spotify:** PKCE login, `/sp:` search, the `o` library browser, and real audio
+  through Connect or librespot. All Spotify networking happens in
+  `scripts/spotify.py`, so the C++ still makes no network calls itself.
+- **Stereo end to end.** Upstream opens the device with one channel and passes
+  `-ac 1` to ffmpeg, so local FLAC and MP3 were flattened to mono too. The
+  spectrum analyser is still fed a mono sum; the device gets full stereo.
+- **A bounded PCM ring** (`src/pcm_ring.h`). Before, each track's buffer was sized
+  from its duration, about 100 MB for a five-minute stereo track, and a stream of
+  unknown length such as librespot's could not be stored at all. The ring is a
+  fixed 8 MiB lock-free buffer that keeps about 12 s of history, so seeking back
+  5 s is still instant.
+- **Clean track switching.** Pressing next used to leave the old song audible
+  while the progress bar and lyrics had already moved on. Now the old track ends
+  when you press the key, and the UI switches only when the new track's audio has
+  actually started.
+- **The queue.** It now works as a list you build up across several searches
+  (see *Navigation & Queue* above). Bulk-adding a YouTube playlist moved from `a`
+  to `g`.
+
+## 🧪 Tests
+
+The C++ unit tests are built by default (`MOUSIKI_BUILD_TESTS=ON`) and have no
+framework dependency:
+
+```powershell
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The Spotify helper's pagination and response handling are covered in Python,
+with no network access:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
 ## 🔧 What the port required
 
 Upstream's POSIX surface turned out to be small and well isolated — the 174 KB
@@ -304,12 +423,19 @@ are byte-identical to upstream miniaudio v0.11.25 and kissfft.
   helper invocations (profile, playlists, saved albums), each a Python start plus
   a TLS handshake. It is fetched once per session and cached after that; `r`
   refetches deliberately.
+- **Spotify audio needs Premium.** Without it, Spotify tracks play through the
+  YouTube fallback.
 - **ARM64 is untested.** The build targets x64.
 
 ## 🙏 Attribution
 
-Mousiki was created by **[ender (itzender5820)](https://github.com/itzender5820)** —
-this fork exists only because the original is worth running on another platform.
+Mousiki was created by **[ender (itzender5820)](https://github.com/itzender5820)**.
+This repository is a fork of [itzender5820/mousiki](https://github.com/itzender5820/mousiki).
+It exists only because the original is worth running on another platform. Bugs
+in the Windows port and the Spotify features belong to this fork, so report them
+here and not upstream.
+
+- **[librespot](https://github.com/librespot-org/librespot)** — optional Spotify audio backend (MIT)
 
 - **[miniaudio](https://github.com/mackron/miniaudio)** — single-file audio playback (public domain / MIT-0)
 - **[kissfft](https://github.com/mborgerding/kissfft)** — real-input FFT behind the spectrum visualizer (BSD-3-Clause)
